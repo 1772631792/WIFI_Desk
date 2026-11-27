@@ -178,6 +178,8 @@ class ClientHandler:
         if quality not in _capture().PRESETS:
             quality = "auto"
         self.quality = quality
+        # 无损档走图块通道；视频通道保留但不发帧，切回其它档位能立刻恢复。
+        self.tile_mode = quality == "pixel"
         self.capture = _capture().ScreenCapture(quality)
         self.qos = _capture().AdaptiveQuality(quality)
         self.capture.params = self.qos.params
@@ -262,6 +264,15 @@ class ClientHandler:
         self.capture.set_preset(preset)
         self.qos.set_preset(preset)
         self.capture.params = self.qos.params
+        want_tiles = preset == "pixel"
+        if want_tiles and not self.tile_mode:
+            # 切到无损：停发视频帧，图块通道先补一张完整画面。
+            # 视频通道不拆，切回其它档位能立刻恢复，不用重新协商。
+            self.tile_mode = True
+            self.capture.prev = None
+        elif not want_tiles and self.tile_mode:
+            self.tile_mode = False
+            self._on_key_request()
         return True
 
     def _release_media(self):
@@ -517,7 +528,7 @@ class ClientHandler:
         with self.capture_lock:
             self.qos.observe(self.peer_rtt, pending=pending, dropped=dropped_delta, loss=loss)
             target = int(self.qos.params["bitrate"])
-        if self.media_ok and self.enc_ema > 0:
+        if self.media_ok and not self.tile_mode and self.enc_ema > 0:
             base_fps = max(15, int(self.qos.params.get("fps", 30)))
             budget = 1000.0 / max(1, self._effective_fps())
             load = self.enc_ema + self.grab_ema
@@ -765,7 +776,7 @@ class ClientHandler:
                 time.sleep(0.5)
                 continue
             self._black_notified = False
-            if media:
+            if media and not self.tile_mode:
                 if not self._send_video(screen, cur):
                     break
             else:

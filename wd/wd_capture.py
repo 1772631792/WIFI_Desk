@@ -27,6 +27,10 @@ PRESETS = {
                "full_chroma": True, "zlib_level": 3, "bitrate": 20_000_000, "crf": 19},
     "sharp": {"tile": 48, "fps": 30, "quality": 98, "dynamic_ratio": 0.92,
               "full_chroma": True, "zlib_level": 2, "bitrate": 60_000_000, "crf": 16},
+    # 无损档：改走图块通道，RGB 原样压缩。H.264 的 4:2:0 会把 ClearType 的
+    # 子像素彩边抹成一片灰，字看着就"糊"；办公场景宁可多占点带宽也要字是实的。
+    "pixel": {"tile": 64, "fps": 24, "quality": 98, "dynamic_ratio": 0.95,
+              "full_chroma": True, "zlib_level": 1, "bitrate": 24_000_000, "crf": 18},
     "latency": {"tile": 160, "fps": 60, "quality": 82, "dynamic_ratio": 0.35,
                 "full_chroma": False, "zlib_level": 1, "bitrate": 40_000_000, "crf": 22},
     "power": {"tile": 192, "fps": 15, "quality": 75, "dynamic_ratio": 0.55,
@@ -50,7 +54,7 @@ class AdaptiveQuality:
         self._set_floors()
 
     def _set_floors(self):
-        if self.preset in ("office", "sharp"):
+        if self.preset in ("office", "sharp", "pixel"):
             self.floor_quality = 85
         elif self.preset in ("latency", "power"):
             self.floor_quality = 55

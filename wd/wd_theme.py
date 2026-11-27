@@ -117,6 +117,9 @@ def qss(theme: str) -> str:
     QScrollBar:vertical {{ background: transparent; width: 8px; margin: 0; }}
     QScrollBar::handle:vertical {{ background: {t['border']}; border-radius: 4px; min-height: 24px; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+    QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 0; }}
+    QScrollBar::handle:horizontal {{ background: {t['border']}; border-radius: 4px; min-width: 24px; }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
     QLabel#mono {{
         font-family: "Cascadia Mono", "Consolas", monospace;
         letter-spacing: 1.4px;

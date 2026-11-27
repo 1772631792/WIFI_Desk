@@ -17,8 +17,8 @@ from .wd_discovery import DiscoveryWorker, primary_ip, run_quiet
 from .wd_input import qt_key_to_vk
 from .wd_session import ClientSession, ServerSession
 
-QUALITY_PRESETS = ["auto", "office", "sharp", "latency", "power"]
-QUALITY_LABELS = ["自动", "清晰办公", "超清", "流畅 60", "节能"]
+QUALITY_PRESETS = ["auto", "office", "sharp", "pixel", "latency", "power"]
+QUALITY_LABELS = ["自动", "清晰办公", "超清", "无损文字", "流畅 60", "节能"]
 
 
 def network_status() -> str:
@@ -381,11 +381,15 @@ class RemoteWindow(QWidget):
         factor = max(0.4, factor)
         if factor >= 0.999:
             self.zoom = "one"
-        win_w = max(900, int(round(remote_w * factor)) + 2)
+        elif remote_w >= 1200:
+            # 桌面尺寸的画面默认按宽度 1:1 铺满：文字是原生像素，纵向留一点滚动，
+            # 比整体缩到 0.88 清楚得多（这是"像商业软件"的关键差别）。
+            self.zoom = "width"
+        win_w = max(900, int(round(remote_w * min(1.0, factor))) + 2)
         win_h = max(600, int(round(remote_h * factor)) + toolbar_h)
         self.resize(win_w, win_h)
         self._build()
-        self.zoom_combo.setCurrentIndex(1 if self.zoom == "one" else 0)
+        self.zoom_combo.setCurrentIndex({"fit": 0, "width": 1, "one": 2}.get(self.zoom, 0))
         self.client.frame_ready.connect(self.set_frame)
         self.client.stats.connect(self.on_stats)
         self.client.file_progress.connect(self.on_file_progress)
@@ -393,6 +397,9 @@ class RemoteWindow(QWidget):
         self.client.connected.connect(self._on_reconnected)
         self.client.disconnected.connect(self._on_disconnected)
         self.show()
+        if self.zoom == "width":
+            # 桌面级分辨率开满窗口：宽度基本就是 1:1，文字不再被整体缩小。
+            self.showMaximized()
         self.set_frame()
 
     def _build(self):
@@ -417,9 +424,8 @@ class RemoteWindow(QWidget):
         self.quality_combo.currentIndexChanged.connect(
             lambda i: self.client.set_quality(QUALITY_PRESETS[i]))
         self.zoom_combo = QComboBox()
-        self.zoom_combo.addItems(["适应窗口", "1:1"])
-        self.zoom_combo.currentIndexChanged.connect(
-            lambda i: setattr(self, "zoom", "fit" if i == 0 else "one") or self.update_view())
+        self.zoom_combo.addItems(["适应窗口", "适应宽度", "1:1"])
+        self.zoom_combo.currentIndexChanged.connect(self._on_zoom_changed)
         quality_label = QLabel("画质")
         zoom_label = QLabel("缩放")
         stats_btn = QPushButton("状态")
@@ -451,7 +457,16 @@ class RemoteWindow(QWidget):
         root.addWidget(self.toolbar)
 
         self.view = RemoteView(self)
-        root.addWidget(self.view, 1)
+        # 1:1 时画面可能比窗口大，用滚动容器让满分辨率画面能平移查看，
+        # 而不是被迫缩小（缩小是发糊的头号原因）。
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(self.view)
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setAlignment(Qt.AlignCenter)
+        self.scroll.setStyleSheet("QScrollArea{background:#000;border:none;}")
+        self.scroll.viewport().installEventFilter(self)
+        root.addWidget(self.scroll, 1)
         self.status_overlay = QLabel("连接中断，正在重连…", self)
         self.status_overlay.setAlignment(Qt.AlignCenter)
         self.status_overlay.setStyleSheet(
@@ -469,6 +484,11 @@ class RemoteWindow(QWidget):
         box.addWidget(self.stat_text)
         root.addWidget(self.stats_panel)
 
+    def eventFilter(self, obj, event):
+        if obj is self.scroll.viewport() and event.type() == QEvent.Resize:
+            self.update_view()
+        return super().eventFilter(obj, event)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self.isFullScreen() and self.toolbar.isVisible():
@@ -479,7 +499,7 @@ class RemoteWindow(QWidget):
 
     def _place_overlay(self):
         if self.status_overlay.isVisible():
-            rect = self.view.geometry()
+            rect = self.scroll.geometry()
             width = min(420, max(240, rect.width() - 48))
             self.status_overlay.setGeometry(
                 rect.x() + (rect.width() - width) // 2,
@@ -496,25 +516,46 @@ class RemoteWindow(QWidget):
         self.canvas = img
         self.update_view()
 
+    def _on_zoom_changed(self, index: int):
+        self.zoom = ("fit", "width", "one")[index]
+        if self.zoom != "fit":
+            self.scroll.horizontalScrollBar().setValue(0)
+            self.scroll.verticalScrollBar().setValue(0)
+        self.update_view()
+
     def update_view(self):
         if self.canvas.isNull():
             return
-        area = self.view.size()
+        area = self.scroll.viewport().size()
         if area.width() < 8 or area.height() < 8:
             return
         dpr = max(1.0, self.view.devicePixelRatioF())
-        logical = (self.canvas.size() if self.zoom == "one"
-                   else self.canvas.size().scaled(area, Qt.KeepAspectRatio))
+        if self.zoom == "one":
+            logical = self.canvas.size()
+        elif self.zoom == "width":
+            ratio = min(1.0, area.width() / max(1, self.canvas.width()))
+            # 只差几个百分点时直接按 1:1 显示：为了塞进窗口做 0.99 倍重采样，
+            # 反而把 1 像素的笔画抹开，得不偿失。
+            if ratio >= 0.97:
+                ratio = 1.0
+            logical = QSize(max(1, int(round(self.canvas.width() * ratio))),
+                            max(1, int(round(self.canvas.height() * ratio))))
+        else:
+            logical = self.canvas.size().scaled(area, Qt.KeepAspectRatio)
+        want = area if self.zoom == "fit" else logical
+        if self.view.size() != want:
+            self.view.setFixedSize(want)
         now = time.perf_counter()
         interval = now - self._last_view_at
         self._last_view_at = now
         # 60 FPS 档省掉锐化：画面在动时流畅比边缘更重要，也避免占满 UI 线程。
         pix = _display_pixmap(self.canvas, logical, dpr, sharpen=interval > 0.022)
         self.view.setPixmap(pix)
+        box = self.view.size()
         shown_w = pix.width() / dpr
         shown_h = pix.height() / dpr
         self.scale = shown_w / max(1, self.canvas.width())
-        self.offset = ((area.width() - shown_w) / 2.0, (area.height() - shown_h) / 2.0)
+        self.offset = ((box.width() - shown_w) / 2.0, (box.height() - shown_h) / 2.0)
 
     def native_pos(self, pos):
         if self.canvas.isNull():
