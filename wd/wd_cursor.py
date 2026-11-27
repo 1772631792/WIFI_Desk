@@ -157,6 +157,52 @@ def _read_sprite(handle):
             _gdi32.DeleteObject(info.hbmMask)
 
 
+def _sprite_cached(handle):
+    now = time.monotonic()
+    if _cache["handle"] == handle and _cache["sprite"] is not None:
+        if now - _cache["at"] < 2.0:
+            return _cache["sprite"], _cache["hot"]
+    parsed = _read_sprite(handle)
+    if parsed is None:
+        _cache.update(handle=handle, sprite=None, hot=(0, 0), at=now)
+        return None
+    _cache.update(handle=handle, sprite=parsed[0], hot=parsed[1], at=now)
+    return parsed[0], parsed[1]
+
+
+def state():
+    """给主控端用的指针状态：返回 (handle, sprite, hotspot, pos, visible)。
+
+    sprite 是 BGRA 数组（读不到时为 None），pos 为屏幕坐标。主控端据此在本机
+    按原生分辨率画指针，不再把指针混进画面里被缩放/压缩糊掉。
+    """
+    if _user32 is None:
+        return None
+    info = CURSORINFO()
+    info.cbSize = ctypes.sizeof(CURSORINFO)
+    if not _user32.GetCursorInfo(ctypes.byref(info)):
+        return None
+    point = (int(info.ptScreenPos.x), int(info.ptScreenPos.y))
+    visible = bool(info.flags & CURSOR_SHOWING)
+    handle = int(info.hCursor or 0)
+    if not visible or not handle:
+        return handle, None, (0, 0), point, False
+    parsed = _sprite_cached(handle)
+    if parsed is None:
+        return handle, None, (0, 0), point, True
+    return handle, parsed[0], parsed[1], point, True
+
+
+def encode_png(sprite) -> bytes:
+    """BGRA 指针位图 → PNG（保留 alpha），32x32 通常不到 1KB。"""
+    try:
+        import cv2
+        ok, buf = cv2.imencode(".png", sprite)
+        return buf.tobytes() if ok else b""
+    except Exception:
+        return b""
+
+
 def _cursor_sprite():
     info = CURSORINFO()
     info.cbSize = ctypes.sizeof(CURSORINFO)
@@ -164,15 +210,9 @@ def _cursor_sprite():
         return None
     if not (info.flags & CURSOR_SHOWING) or not info.hCursor:
         return None
-    now = time.monotonic()
-    if _cache["handle"] == info.hCursor and _cache["sprite"] is not None:
-        if now - _cache["at"] < 2.0:
-            return _cache["sprite"], _cache["hot"], info.ptScreenPos
-    parsed = _read_sprite(info.hCursor)
+    parsed = _sprite_cached(info.hCursor)
     if parsed is None:
-        _cache.update(handle=info.hCursor, sprite=None, hot=(0, 0), at=now)
         return None
-    _cache.update(handle=info.hCursor, sprite=parsed[0], hot=parsed[1], at=now)
     return parsed[0], parsed[1], info.ptScreenPos
 
 

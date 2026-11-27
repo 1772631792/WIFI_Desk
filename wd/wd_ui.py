@@ -4,8 +4,8 @@ import subprocess
 import threading
 import time
 
-from PySide6.QtCore import Qt, QEvent, QSize, Signal, QTimer, QPropertyAnimation
-from PySide6.QtGui import QImage, QPixmap, QColor, QCursor, QGuiApplication
+from PySide6.QtCore import Qt, QEvent, QSize, QRectF, Signal, QTimer, QPropertyAnimation
+from PySide6.QtGui import QImage, QPixmap, QColor, QCursor, QGuiApplication, QPainter
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QScrollArea, QFrame, QComboBox, QCheckBox, QSpinBox, QLineEdit,
@@ -17,8 +17,9 @@ from .wd_discovery import DiscoveryWorker, primary_ip, run_quiet
 from .wd_input import qt_key_to_vk
 from .wd_session import ClientSession, ServerSession
 
-QUALITY_PRESETS = ["auto", "office", "sharp", "pixel", "latency", "power"]
-QUALITY_LABELS = ["自动", "清晰办公", "超清", "无损文字", "流畅 60", "节能"]
+QUALITY_PRESETS = ["auto", "office", "sharp", "qhd60", "pixel", "latency", "power"]
+QUALITY_LABELS = ["自动", "清晰办公", "超清", "2K 60", "无损文字", "流畅 60", "节能"]
+ZOOM_INDEX = {"fit": 0, "width": 1, "one": 2}
 
 
 def network_status() -> str:
@@ -341,6 +342,11 @@ class RemoteView(QLabel):
         self.owner.release_all()
         super().focusOutEvent(event)
 
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # 远端指针由本机按原生分辨率绘制，不参与画面缩放/压缩
+        self.owner.paint_cursor(self)
+
 
 class RemoteWindow(QWidget):
     def __init__(self, client: ClientSession, device: dict, config, info: dict, main=None):
@@ -359,6 +365,8 @@ class RemoteWindow(QWidget):
         self.scale = 1.0
         self.offset = (0, 0)
         self.zoom = "fit"
+        self._prev_zoom = "fit"
+        self.remote_size = (1280, 720)
         self.pressed_keys = set()
         self.reconnect_attempts = 0
         self.reconnect_timer = QTimer(self)
@@ -372,6 +380,7 @@ class RemoteWindow(QWidget):
             remote_h = max(240, min(4320, int(info.get("h", 720))))
         except (TypeError, ValueError):
             remote_w, remote_h = 1280, 720
+        self.remote_size = (remote_w, remote_h)
         screen = QGuiApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else None
         # 窗口尽量开满可用区域：缩放比例越接近 1:1，远处画面就越清楚。
@@ -399,6 +408,7 @@ class RemoteWindow(QWidget):
         self.client.stats.connect(self.on_stats)
         self.client.file_progress.connect(self.on_file_progress)
         self.client.cursor_visible.connect(self.on_cursor_visible)
+        self.client.cursor_moved.connect(self.on_cursor_moved)
         self.client.connected.connect(self._on_reconnected)
         self.client.disconnected.connect(self._on_disconnected)
         self.show()
@@ -462,6 +472,31 @@ class RemoteWindow(QWidget):
         root.addWidget(self.toolbar)
 
         self.view = RemoteView(self)
+        # 全屏时只留一个会自动隐藏的小胶囊，不再用 48px 长条盖住远端画面顶部。
+        self.mini_bar = QFrame(self)
+        self.mini_bar.setObjectName("miniBar")
+        self.mini_bar.setStyleSheet(
+            "QFrame#miniBar { background: rgba(24,28,36,225); border: 1px solid #2B3442;"
+            " border-radius: 16px; }"
+            "QFrame#miniBar QLabel { color: #A5B1C2; font-size: 12px; }"
+            "QFrame#miniBar QPushButton { background: transparent; color: #EDF2F8;"
+            " border: none; padding: 3px 10px; border-radius: 10px; font-size: 13px; }"
+            "QFrame#miniBar QPushButton:hover { background: #2A3240; }"
+        )
+        mini_row = QHBoxLayout(self.mini_bar)
+        mini_row.setContentsMargins(12, 3, 6, 3)
+        mini_row.setSpacing(4)
+        self.mini_label = QLabel("已连接")
+        mini_row.addWidget(self.mini_label)
+        mini_exit = QPushButton("退出全屏")
+        mini_exit.setToolTip("Esc")
+        mini_exit.clicked.connect(self.toggle_fullscreen)
+        mini_close = QPushButton("断开")
+        mini_close.clicked.connect(self.close)
+        mini_row.addWidget(mini_exit)
+        mini_row.addWidget(mini_close)
+        self.mini_bar.adjustSize()
+        self.mini_bar.hide()
         # 1:1 时画面可能比窗口大，用滚动容器让满分辨率画面能平移查看，
         # 而不是被迫缩小（缩小是发糊的头号原因）。
         self.scroll = QScrollArea()
@@ -503,9 +538,8 @@ class RemoteWindow(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.isFullScreen() and self.toolbar.isVisible():
-            self.toolbar.resize(self.width(), 48)
-            self.toolbar.move(0, 0)
+        if self.isFullScreen() and self.mini_bar.isVisible():
+            self.mini_bar.move(max(0, (self.width() - self.mini_bar.width()) // 2), 8)
         self._place_overlay()
         self._schedule_view()
 
@@ -592,7 +626,6 @@ class RemoteWindow(QWidget):
 
     def mouse_press(self, event):
         self.view.setFocus()
-        self._peek_toolbar()
         pos = self.native_pos(event.position().toPoint())
         if not pos:
             return
@@ -608,13 +641,14 @@ class RemoteWindow(QWidget):
             self.client.send_input({"a": "up", "button": button})
 
     def mouse_move(self, event):
-        self._peek_toolbar()
+        # 全屏时只有把指针移到屏幕顶部才浮现小胶囊，平时完全让出画面
+        if self.isFullScreen() and event.position().y() <= 4:
+            self._peek_toolbar()
         pos = self.native_pos(event.position().toPoint())
         if pos:
             self.client.send_input({"a": "move", "nx": pos[0], "ny": pos[1]})
 
     def mouse_wheel(self, event):
-        self._peek_toolbar()
         delta = event.angleDelta().y()
         if delta:
             self.client.send_input({"a": "wheel", "delta": 120 if delta > 0 else -120})
@@ -635,9 +669,38 @@ class RemoteWindow(QWidget):
             self.client.send_input({"a": "key", "vk": vk, "down": True})
 
     def on_cursor_visible(self, visible: bool):
-        # 远端自己把指针藏起来时（全屏视频、某些拖动场景），保留本地箭头，
-        # 否则画面上一个指针都看不到。
-        self.view.setCursor(Qt.BlankCursor if visible else Qt.ArrowCursor)
+        # 有本地指针位图时隐藏系统箭头，避免两个指针叠在一起。
+        self._apply_cursor_mode()
+
+    def on_cursor_moved(self):
+        self._apply_cursor_mode()
+        if not self.canvas.isNull():
+            # 只重绘叠加层，不重新缩放整帧：指针移动不该有额外开销。
+            self.view.update()
+
+    def _apply_cursor_mode(self):
+        sprite = getattr(self.client, "cursor_sprite", None)
+        on = bool(getattr(self.client, "cursor_on", False))
+        self.view.setCursor(Qt.BlankCursor if (sprite is not None and on) else Qt.ArrowCursor)
+
+    def paint_cursor(self, widget):
+        sprite = getattr(self.client, "cursor_sprite", None)
+        if sprite is None or not getattr(self.client, "cursor_on", False):
+            return
+        scale = self.scale
+        if scale <= 0:
+            return
+        hot_x, hot_y = getattr(self.client, "cursor_hot", (0, 0))
+        px, py = getattr(self.client, "cursor_pos", (0, 0))
+        width = max(1.0, sprite.width() * scale)
+        height = max(1.0, sprite.height() * scale)
+        x = self.offset[0] + (px - hot_x) * scale
+        y = self.offset[1] + (py - hot_y) * scale
+        painter = QPainter(widget)
+        if abs(scale - 1.0) > 0.01:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawImage(QRectF(x, y, width, height), sprite)
+        painter.end()
 
     def pick_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择要发送到被控端的文件")
@@ -683,39 +746,48 @@ class RemoteWindow(QWidget):
     def _peek_toolbar(self):
         if not self.isFullScreen():
             return
-        self.toolbar.show()
-        self.toolbar.raise_()
-        self.toolbar.resize(self.width(), 48)
-        self.toolbar.move(0, 0)
-        self.toolbar_timer.start(2500)
+        self.mini_bar.adjustSize()
+        self.mini_bar.move(max(0, (self.width() - self.mini_bar.width()) // 2), 8)
+        self.mini_bar.show()
+        self.mini_bar.raise_()
+        self.toolbar_timer.start(2200)
 
     def _hide_fullscreen_toolbar(self):
         if self.isFullScreen():
-            self.toolbar.hide()
+            self.mini_bar.hide()
+
+    def _min_canvas_fits(self, width: int, height: int) -> bool:
+        if not self.canvas.isNull():
+            return self.canvas.width() <= width and self.canvas.height() <= height
+        remote_w, remote_h = self.remote_size
+        return remote_w <= width and remote_h <= height
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.toolbar_timer.stop()
+            self.mini_bar.hide()
             self.showNormal()
-            self.toolbar.setParent(None)
-            self.layout().insertWidget(0, self.toolbar)
             self.toolbar.show()
-            for widget in self.toolbar_extras:
-                widget.show()
             self.full_btn.setText("全屏")
+            # 回到窗口模式时恢复进入全屏前的缩放方式
+            self.zoom = self._prev_zoom
+            self.zoom_combo.setCurrentIndex(ZOOM_INDEX.get(self.zoom, 0))
+            self._place_overlay()
+            self.update_view()
             return
+        self._prev_zoom = self.zoom
         self.showFullScreen()
         self.stats_panel.hide()
-        for widget in self.toolbar_extras:
-            widget.hide()
-        self.layout().removeWidget(self.toolbar)
-        self.toolbar.setParent(self)
-        self.toolbar.resize(self.width(), 48)
-        self.toolbar.move(0, 0)
-        self.toolbar.show()
-        self.toolbar.raise_()
-        self.full_btn.setText("退出全屏")
-        self.toolbar_timer.start(1200)
+        self.toolbar.hide()          # 长条工具栏不进全屏，避免盖住远端画面顶部
+        screen = self.screen()
+        geo = screen.geometry() if screen else None
+        fits = self._min_canvas_fits(geo.width(), geo.height()) if geo else False
+        # 全屏就是满屏：放得下就 1:1，放不下整体适应，都不留滚动条
+        self.zoom = "one" if fits else "fit"
+        self.zoom_combo.setCurrentIndex(ZOOM_INDEX.get(self.zoom, 0))
+        self.view.setFocus()
+        self.update_view()
+        self._peek_toolbar()
 
     def toggle_stats(self, checked):
         self.stats_panel.setVisible(bool(checked))
@@ -738,6 +810,10 @@ class RemoteWindow(QWidget):
         )
         dec = float(data.get("dec", 0) or 0)
         dec_txt = f"   解码 {dec:.0f} ms" if dec else ""
+        if self.isFullScreen():
+            self.mini_label.setText(
+                f"{data.get('mode', '-')} · {data.get('fps', 0)} FPS · "
+                f"延迟 {data.get('rtt', 0)} ms")
         self.stat_text.setText(
             f"FPS {data.get('fps', 0)}   RTT {data.get('rtt', 0)} ms   "
             f"{data.get('kbps', 0)} kbps{dec_txt}   JPEG 质量 {qf or '-'}   "
@@ -770,6 +846,7 @@ class RemoteWindow(QWidget):
             (old.frame_ready, self.set_frame), (old.stats, self.on_stats),
             (old.connected, self._on_reconnected), (old.disconnected, self._on_disconnected),
             (old.file_progress, self.on_file_progress), (old.cursor_visible, self.on_cursor_visible),
+            (old.cursor_moved, self.on_cursor_moved),
         ):
             try:
                 signal.disconnect(slot)
@@ -783,6 +860,7 @@ class RemoteWindow(QWidget):
         client.disconnected.connect(self._on_disconnected)
         client.file_progress.connect(self.on_file_progress)
         client.cursor_visible.connect(self.on_cursor_visible)
+        client.cursor_moved.connect(self.on_cursor_moved)
 
     def _try_reconnect(self):
         if not self.isVisible() or self.client.manual:

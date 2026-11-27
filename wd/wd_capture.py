@@ -31,6 +31,9 @@ PRESETS = {
     # 子像素彩边抹成一片灰，字看着就"糊"；办公场景宁可多占点带宽也要字是实的。
     "pixel": {"tile": 64, "fps": 24, "quality": 98, "dynamic_ratio": 0.95,
               "full_chroma": True, "zlib_level": 1, "bitrate": 24_000_000, "crf": 18},
+    # 2K 60 帧：软件编码一般喂不满，跟不上会自动降帧率（保分辨率）。
+    "qhd60": {"tile": 64, "fps": 60, "quality": 96, "dynamic_ratio": 0.55,
+              "full_chroma": True, "zlib_level": 1, "bitrate": 90_000_000, "crf": 18},
     "latency": {"tile": 160, "fps": 60, "quality": 82, "dynamic_ratio": 0.35,
                 "full_chroma": False, "zlib_level": 1, "bitrate": 40_000_000, "crf": 22},
     "power": {"tile": 192, "fps": 15, "quality": 75, "dynamic_ratio": 0.55,
@@ -54,14 +57,19 @@ class AdaptiveQuality:
         self._set_floors()
 
     def _set_floors(self):
-        if self.preset in ("office", "sharp", "pixel"):
+        if self.preset in ("office", "sharp", "pixel", "qhd60"):
             self.floor_quality = 85
         elif self.preset in ("latency", "power"):
             self.floor_quality = 55
         else:
             self.floor_quality = 75
         # 远程桌面宁可掉画质也别掉帧：帧率下限保持在流畅区间。
-        self.floor_fps = 15 if self.preset == "power" else 24
+        if self.preset == "power":
+            self.floor_fps = 15
+        elif self.preset == "qhd60":
+            self.floor_fps = 30
+        else:
+            self.floor_fps = 24
 
     def set_preset(self, preset: str):
         self.preset = preset if preset in PRESETS else "auto"
@@ -129,6 +137,9 @@ class ScreenCapture:
         self._closed = False
         self._first = True
         self.cursor_visible = True
+        # 主控端支持本地画指针时置 False：指针由主控端按原生分辨率绘制，
+        # 既不糊，也不会因为指针移动而整片图块重传。
+        self.draw_cursor = True
 
     def set_preset(self, preset: str):
         self.params = dict(PRESETS.get(preset, PRESETS["auto"]))
@@ -187,9 +198,12 @@ class ScreenCapture:
                 if cur.ndim == 3 and cur.shape[2] == 3:
                     self._first = False
                     self._last = cur
-                    try:
-                        self.cursor_visible = bool(_draw_cursor(cur))
-                    except Exception:
+                    if self.draw_cursor:
+                        try:
+                            self.cursor_visible = bool(_draw_cursor(cur))
+                        except Exception:
+                            self.cursor_visible = False
+                    else:
                         self.cursor_visible = False
                     self.black = self._is_black(cur)
                     return cur
@@ -201,9 +215,12 @@ class ScreenCapture:
         cur = np.asarray(ImageGrab.grab())
         self._first = False
         self._last = cur
-        try:
-            self.cursor_visible = bool(_draw_cursor(cur))
-        except Exception:
+        if self.draw_cursor:
+            try:
+                self.cursor_visible = bool(_draw_cursor(cur))
+            except Exception:
+                self.cursor_visible = False
+        else:
             self.cursor_visible = False
         self.black = self._is_black(cur)
         return cur
@@ -212,6 +229,10 @@ class ScreenCapture:
     def _is_black(cur: np.ndarray) -> bool:
         # 锁屏/切换用户/安全桌面时可能抓到全黑，先标记避免把黑帧发出去。
         return bool(cur.size and cur[::16, ::16].mean() < 2.0)
+
+    def last_frame(self):
+        """最近一帧（不触发新的抓屏），供静止后补无损帧使用。"""
+        return self._last
 
     def close(self):
         # dxcam.create 是进程内单例；重连时旧会话若 release，会让新会话

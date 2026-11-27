@@ -19,6 +19,9 @@ RESUME_TTL = 120.0
 TILES_PER_MESSAGE = 128  # 留在现有协议的 8 KiB 消息头限制内
 MEDIA_GRACE = 5.0        # 首帧送达前允许的协商时间
 MEDIA_ACK_TIMEOUT = 3.0  # 超过该时长没有媒体确认就回退图块
+# 画面停下多久后补一张无损帧：所有画质档位静止时都能回到"字是实的"状态。
+REFINE_IDLE = 0.15
+CURSOR_INTERVAL = 0.012   # 指针位置查询间隔（约 80Hz，只发变化）
 # 无损档的静止/运动切换阈值（按变化面积占比）：大范围变化交给视频保帧率，
 # 回落后补一张无损全帧把文字重新变实。
 HYBRID_MOTION = 0.45
@@ -214,6 +217,15 @@ class ClientHandler:
         self._uploads = {}
         self.transfer_active = False
         self._last_tiles = 0
+        # 采集线程与发送线程之间的单帧交接（覆盖式，永远只保留最新一帧）
+        self.frame_lock = threading.Lock()
+        self._grab_frame = None
+        self._grab_serial = 0
+        self._grab_black = False
+        self._grab_backend = ""
+        self._grab_backend_error = ""
+        self._refine_pending = False
+        self._last_sent_at = 0.0
         self.media_lost = 0
         self.media_err = 0
         self.media_frames = 0
@@ -735,6 +747,14 @@ class ClientHandler:
             self.heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop, daemon=True, name="wd-ctrl-hb")
             self.heartbeat_thread.start()
+            # 指针改由主控端本地绘制：画面里不再混合指针，省得被缩放/压缩糊掉，
+            # 也避免指针移动带动一片图块重传。
+            screen.draw_cursor = False
+            screen.cursor_visible = False
+            threading.Thread(target=self._cursor_loop, daemon=True,
+                             name="wd-cursor").start()
+            threading.Thread(target=self._capture_loop, args=(screen,), daemon=True,
+                             name="wd-capture").start()
             self._send_loop(screen)
         except Exception as exc:
             try:
@@ -772,45 +792,108 @@ class ClientHandler:
             return max(15, min(base, int(self.fps_cap)))
         return base
 
+    def _capture_loop(self, screen):
+        """采集独立成线程：抓屏和后面的差分/打包/编码流水化，互不阻塞。"""
+        next_at = 0.0
+        while self.alive:
+            now = time.perf_counter()
+            if now < next_at:
+                time.sleep(min(next_at - now, 0.004))
+                continue
+            started = time.perf_counter()
+            try:
+                cur = screen.grab()
+            except Exception as exc:
+                try:
+                    self.server.log.emit(f"采集失败：{exc}")
+                except RuntimeError:
+                    pass
+                time.sleep(0.5)
+                continue
+            spent = (time.perf_counter() - started) * 1000.0
+            self.grab_ema = spent if self.grab_ema <= 0 else self.grab_ema * 0.8 + spent * 0.2
+            with self.frame_lock:
+                self._grab_backend = screen.backend
+                self._grab_backend_error = screen.backend_error
+                self._grab_black = bool(screen.black)
+                if cur is not None:
+                    self._grab_frame = cur
+                    self._grab_serial += 1
+            fps = self._effective_fps()
+            if self.transfer_active:
+                fps = min(fps, 8)
+            next_at = started + 1.0 / max(1, fps)
+            if cur is None:
+                # 桌面没变化：退避一点，避免空转吃 CPU
+                time.sleep(0.002)
+
+    def _cursor_loop(self):
+        """把指针形状和位置单独发给主控端，由它按原生分辨率绘制。"""
+        from . import wd_cursor
+        last_handle = None
+        last_pos = None
+        last_vis = None
+        while self.alive:
+            try:
+                st = wd_cursor.state()
+            except Exception:
+                st = None
+            if st is None:
+                time.sleep(0.05)
+                continue
+            handle, sprite, hot, pos, visible = st
+            if sprite is not None and handle != last_handle:
+                png = wd_cursor.encode_png(sprite)
+                if png:
+                    self._send("CURSOR_IMG", png, priority=True,
+                               w=int(sprite.shape[1]), h=int(sprite.shape[0]),
+                               hx=int(hot[0]), hy=int(hot[1]))
+                    last_handle = handle
+            if pos != last_pos or visible != last_vis:
+                self._send("CURSOR_POS", priority=True,
+                           x=int(pos[0]), y=int(pos[1]), vis=bool(visible and sprite is not None))
+            last_pos, last_vis = pos, visible
+            time.sleep(CURSOR_INTERVAL)
+
     def _send_loop(self, screen):
         # 节拍用高精度时钟：Windows 上 time.monotonic() 只有约 15.6ms 粒度，
         # 用它算帧间隔会让每帧多睡一次，30 FPS 被压到 20 FPS 左右。
         next_at = 0.0
         idle_since = 0.0
         jpeg_active = False
+        last_serial = -1
         while self.alive:
             media = self._media_alive()
             target_fps = self._effective_fps()
             if self.transfer_active:
                 # 传文件时把画面降到 8 FPS，把带宽和 CPU 让给文件通道。
                 target_fps = min(target_fps, 8)
+            with self.frame_lock:
+                serial = self._grab_serial
+                cur = self._grab_frame
+                black = self._grab_black
+            if cur is None or serial == last_serial:
+                # 桌面没有变化：不编码也不发送。
+                if self._refine_pending and not self.tile_mode:
+                    if time.monotonic() - self._last_sent_at >= REFINE_IDLE:
+                        self._refine_pending = False
+                        self._refine_once(screen)
+                if not idle_since:
+                    idle_since = time.perf_counter()
+                time.sleep(0.001 if time.perf_counter() - idle_since < 0.5 else 0.008)
+                continue
             now = time.perf_counter()
             if now < next_at:
                 time.sleep(min(next_at - now, 0.004))
                 continue
-            try:
-                grab_started = time.perf_counter()
-                cur = screen.grab()
-                spent = (time.perf_counter() - grab_started) * 1000.0
-                self.grab_ema = spent if self.grab_ema <= 0 else self.grab_ema * 0.8 + spent * 0.2
-            except Exception as exc:
-                self.server.log.emit(f"采集失败：{exc}")
-                time.sleep(0.5)
-                continue
-            if cur is None:
-                # 桌面没有变化：不编码也不发送。短间隔重试保证动起来的第一帧不迟到，
-                # 长时间静止后退避到 8ms，避免空转吃 CPU。
-                if not idle_since:
-                    idle_since = now
-                time.sleep(0.001 if now - idle_since < 0.5 else 0.008)
-                continue
+            last_serial = serial
             idle_since = 0.0
             next_at = now + 1.0 / max(1, target_fps)
             if not self._backend_logged:
-                detail = f"（{screen.backend_error}）" if screen.backend_error else ""
-                self.server.log.emit(f"采集后端：{screen.backend}{detail}")
+                detail = f"（{self._grab_backend_error}）" if self._grab_backend_error else ""
+                self.server.log.emit(f"采集后端：{self._grab_backend}{detail}")
                 self._backend_logged = True
-            if screen.black:
+            if black:
                 if not self._black_notified:
                     self.server.log.emit("采集到黑屏：被控端可能锁屏、切换用户或运行在非交互桌面")
                     self._black_notified = True
@@ -820,15 +903,29 @@ class ClientHandler:
             if media and not self.tile_mode:
                 if not self._send_video(screen, cur):
                     break
+                self._refine_pending = True
             else:
                 ok, jpeg_active, want_video = self._send_tiles(screen, cur, jpeg_active)
                 if not ok:
                     break
                 if want_video and not self._send_video(screen, cur):
                     break
+            self._last_sent_at = time.monotonic()
             now = time.monotonic()
             if now - self.last_stat >= 1.0:
                 self._publish_stats(now)
+
+    def _refine_once(self, screen):
+        """画面静止后用无损图块重发一帧：把视频的 4:2:0 糊边换成原生像素。"""
+        frame = screen.last_frame()
+        if frame is None:
+            return
+        try:
+            # 注意：_send_tiles 内部自己会拿 capture_lock，这里不能再套一层（会死锁）。
+            screen.prev = None          # 强制整帧，不能用差分（画布已被视频帧覆盖过）
+            self._send_tiles(screen, frame, False)
+        except Exception:
+            pass
 
     def _upload_dir(self) -> str:
         base = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -991,6 +1088,7 @@ class ClientSession(QObject):
     file_progress = Signal(dict)
     clipboard_text = Signal(str)
     cursor_visible = Signal(bool)
+    cursor_moved = Signal()
 
     def __init__(self, config, device: dict, quality: str = "auto", parent=None,
                  resume_token: str = ""):
@@ -1026,6 +1124,11 @@ class ClientSession(QObject):
         self.codec_name = ""
         self.remote_size = (0, 0)
         self.stream_size = (0, 0)
+        # 指针由主控端本地绘制：形状来自被控端的 CURSOR_IMG，位置来自 CURSOR_POS
+        self.cursor_sprite = None
+        self.cursor_hot = (0, 0)
+        self.cursor_pos = (0, 0)
+        self.cursor_on = False
         self._media_bytes_last = 0
         self._clip_last = ""
         # 剪贴板只能在 GUI 线程改，接收线程通过信号转回来。
@@ -1416,6 +1519,23 @@ class ClientSession(QObject):
                     self.media.set_codec(codec)
                     self.mode = "H.265" if codec == "hevc" else "H.264"
                     self.log.emit(f"编码格式切换为 {self.mode}")
+            elif typ == "CURSOR_IMG":
+                img = QImage.fromData(payload)
+                self.cursor_sprite = None if img.isNull() else img
+                try:
+                    self.cursor_hot = (int(meta.get("hx", 0) or 0),
+                                       int(meta.get("hy", 0) or 0))
+                except (TypeError, ValueError):
+                    self.cursor_hot = (0, 0)
+                self.cursor_moved.emit()
+            elif typ == "CURSOR_POS":
+                try:
+                    self.cursor_pos = (int(meta.get("x", 0) or 0),
+                                       int(meta.get("y", 0) or 0))
+                except (TypeError, ValueError):
+                    pass
+                self.cursor_on = bool(meta.get("vis", False))
+                self.cursor_moved.emit()
             elif typ == "DISCONNECT":
                 break
             else:
