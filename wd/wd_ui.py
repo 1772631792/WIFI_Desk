@@ -337,6 +337,7 @@ class RemoteWindow(QWidget):
         self.client.frame_ready.connect(self.set_frame)
         self.client.stats.connect(self.on_stats)
         self.client.file_progress.connect(self.on_file_progress)
+        self.client.cursor_visible.connect(self.on_cursor_visible)
         self.client.connected.connect(self._on_reconnected)
         self.client.disconnected.connect(self._on_disconnected)
         self.show()
@@ -512,6 +513,11 @@ class RemoteWindow(QWidget):
             self.pressed_keys.add(vk)
             self.client.send_input({"a": "key", "vk": vk, "down": True})
 
+    def on_cursor_visible(self, visible: bool):
+        # 远端自己把指针藏起来时（全屏视频、某些拖动场景），保留本地箭头，
+        # 否则画面上一个指针都看不到。
+        self.view.setCursor(Qt.BlankCursor if visible else Qt.ArrowCursor)
+
     def pick_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择要发送到被控端的文件")
         if paths:
@@ -641,6 +647,7 @@ class RemoteWindow(QWidget):
         for signal, slot in (
             (old.frame_ready, self.set_frame), (old.stats, self.on_stats),
             (old.connected, self._on_reconnected), (old.disconnected, self._on_disconnected),
+            (old.file_progress, self.on_file_progress), (old.cursor_visible, self.on_cursor_visible),
         ):
             try:
                 signal.disconnect(slot)
@@ -652,6 +659,8 @@ class RemoteWindow(QWidget):
         client.stats.connect(self.on_stats)
         client.connected.connect(self._on_reconnected)
         client.disconnected.connect(self._on_disconnected)
+        client.file_progress.connect(self.on_file_progress)
+        client.cursor_visible.connect(self.on_cursor_visible)
 
     def _try_reconnect(self):
         if not self.isVisible() or self.client.manual:

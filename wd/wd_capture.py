@@ -4,6 +4,7 @@
 视频播放器等硬件加速窗口；不可用时回退 PIL/GDI。分块比较仍用 NumPy，
 不逐像素 Python 循环。
 """
+import threading
 import time
 import zlib
 
@@ -12,6 +13,9 @@ import numpy as np
 from PIL import ImageGrab
 
 from .wd_cursor import draw as _draw_cursor
+
+# dxcam 的 Duplicator 是进程级单例，多会话并发抓屏会触发原生崩溃。
+_CAMERA_LOCK = threading.Lock()
 
 # 参考 RustDesk 的预设分层：清晰档优先保文字边缘，低延迟档优先保帧率。
 # dynamic_ratio 是切换到整帧 JPEG 的阈值，越高越偏向无损瓦片。
@@ -119,6 +123,7 @@ class ScreenCapture:
         self._last = None
         self._closed = False
         self._first = True
+        self.cursor_visible = True
 
     def set_preset(self, preset: str):
         self.params = dict(PRESETS.get(preset, PRESETS["auto"]))
@@ -167,7 +172,8 @@ class ScreenCapture:
         camera = self._ensure_camera()
         if camera is not None:
             try:
-                frame = camera.grab(new_frame_only=not self._first)
+                with _CAMERA_LOCK:
+                    frame = camera.grab(new_frame_only=not self._first)
             except Exception as exc:
                 self._drop_camera(f"{type(exc).__name__}: {exc}")
                 frame = None
@@ -176,7 +182,10 @@ class ScreenCapture:
                 if cur.ndim == 3 and cur.shape[2] == 3:
                     self._first = False
                     self._last = cur
-                    _draw_cursor(cur)
+                    try:
+                        self.cursor_visible = bool(_draw_cursor(cur))
+                    except Exception:
+                        self.cursor_visible = False
                     self.black = self._is_black(cur)
                     return cur
             if not self._first:
@@ -187,7 +196,10 @@ class ScreenCapture:
         cur = np.asarray(ImageGrab.grab())
         self._first = False
         self._last = cur
-        _draw_cursor(cur)
+        try:
+            self.cursor_visible = bool(_draw_cursor(cur))
+        except Exception:
+            self.cursor_visible = False
         self.black = self._is_black(cur)
         return cur
 

@@ -24,6 +24,7 @@ MAX_FRAGMENTS = 20000
 REPLAY_WINDOW = 4096
 FLAG_KEY = 0x01
 FLAG_RAW = 0x02
+FLAG_CURSOR = 0x04   # 画面里是否已经画了远端指针
 
 # 关键帧请求走同一条 UDP 通道，单独用一套 nonce 前缀和序号，
 # 避免与视频分片复用 (前缀, 序号) 造成 GCM nonce 重用。
@@ -186,13 +187,14 @@ class MediaTx:
         self._tokens = max(0.0, self._tokens + delay * self.bitrate / 8.0 - size)
 
     def send(self, payload: bytes, keyframe: bool = False, raw: bool = False,
-             frame_id: int = 0):
+             frame_id: int = 0, cursor: bool = False):
         if len(payload) > MAX_FRAME_BYTES:
             raise ValueError("视频帧过大")
         count = max(1, (len(payload) + MAX_PAYLOAD - 1) // MAX_PAYLOAD)
         if count > MAX_FRAGMENTS:
             raise ValueError("视频帧分片过多")
-        flags = (FLAG_KEY if keyframe else 0) | (FLAG_RAW if raw else 0)
+        flags = ((FLAG_KEY if keyframe else 0) | (FLAG_RAW if raw else 0)
+                 | (FLAG_CURSOR if cursor else 0))
         with self.lock:
             self._pace(len(payload))
             for index in range(count):
@@ -224,7 +226,7 @@ class MediaTx:
 class MediaRx:
     def __init__(self, key: bytes, nonce_prefix: bytes, width: int, height: int,
                  epoch: int = 1, on_frame=None, on_snapshot=None, on_keyframe=None,
-                 sock=None, peer=None, codec: str = "h264"):
+                 sock=None, peer=None, codec: str = "h264", on_cursor=None):
         self.width = int(width)
         self.height = int(height)
         self.epoch = int(epoch)
@@ -241,6 +243,7 @@ class MediaRx:
         self.on_frame = on_frame
         self.on_snapshot = on_snapshot
         self.on_keyframe = on_keyframe
+        self.on_cursor = on_cursor
         self.sock = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
         if sock is None:
@@ -252,6 +255,7 @@ class MediaRx:
         self.thread = None
         self.decoder = None
         self.decoder_lock = threading.Lock()
+        self.cursor_visible = True
         self.pending = {}
         self.last_frame_id = 0
         self.need_keyframe = False
@@ -449,9 +453,17 @@ class MediaRx:
         payload = b"".join(entry["parts"])
         self.pending.pop(frame_id, None)
         self.last_frame_id = max(self.last_frame_id, frame_id)
-        self._deliver(payload, bool(flags & FLAG_KEY), bool(flags & FLAG_RAW))
+        self._deliver(payload, bool(flags & FLAG_KEY), bool(flags & FLAG_RAW),
+                      bool(flags & FLAG_CURSOR))
 
-    def _deliver(self, payload: bytes, keyframe: bool, raw: bool):
+    def _deliver(self, payload: bytes, keyframe: bool, raw: bool, cursor: bool = True):
+        if cursor != self.cursor_visible:
+            self.cursor_visible = cursor
+            if self.on_cursor:
+                try:
+                    self.on_cursor(cursor)
+                except Exception:
+                    pass
         if raw:
             try:
                 expected = self.width * self.height * 3

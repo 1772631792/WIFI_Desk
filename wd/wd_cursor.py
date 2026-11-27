@@ -12,6 +12,7 @@ import numpy as np
 CURSOR_SHOWING = 0x0001
 DIB_RGB_COLORS = 0
 BI_RGB = 0
+DI_NORMAL = 0x0003
 
 _user32 = ctypes.windll.user32 if hasattr(ctypes, "windll") else None
 _gdi32 = ctypes.windll.gdi32 if hasattr(ctypes, "windll") else None
@@ -60,45 +61,94 @@ if _user32 and _gdi32:
     _gdi32.SelectObject.restype = _HANDLE
     _gdi32.GetDIBits.argtypes = [_HANDLE, _HANDLE, wintypes.UINT, wintypes.UINT,
                                  ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]
+    _gdi32.CreateDIBSection.argtypes = [_HANDLE, ctypes.c_void_p, wintypes.UINT,
+                                        ctypes.POINTER(ctypes.c_void_p), _HANDLE,
+                                        wintypes.DWORD]
+    _gdi32.CreateDIBSection.restype = _HANDLE
+    _gdi32.GdiFlush.argtypes = []
+    _user32.DrawIconEx.argtypes = [_HANDLE, ctypes.c_int, ctypes.c_int, _HANDLE,
+                                   ctypes.c_int, ctypes.c_int, wintypes.UINT,
+                                   _HANDLE, wintypes.UINT]
     _gdi32.DeleteDC.argtypes = [_HANDLE]
     _gdi32.DeleteObject.argtypes = [_HANDLE]
 
 
+def _draw_on(handle, width, height, background):
+    """把光标画到指定背景色的 32 位 DIB 上，返回 BGRA 数组。"""
+    header = BITMAPINFOHEADER()
+    header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    header.biWidth = width
+    header.biHeight = -height
+    header.biPlanes = 1
+    header.biBitCount = 32
+    header.biCompression = BI_RGB
+    bits = ctypes.c_void_p()
+    screen_dc = _user32.GetDC(None)
+    dib = _gdi32.CreateDIBSection(screen_dc, ctypes.byref(header), DIB_RGB_COLORS,
+                                  ctypes.byref(bits), None, 0)
+    if not dib or not bits:
+        _user32.ReleaseDC(None, screen_dc)
+        return None
+    mem_dc = None
+    try:
+        ctypes.memset(bits, background, width * height * 4)
+        mem_dc = _gdi32.CreateCompatibleDC(screen_dc)
+        _gdi32.SelectObject(mem_dc, dib)
+        if not _user32.DrawIconEx(mem_dc, 0, 0, handle, width, height,
+                                  0, None, DI_NORMAL):
+            return None
+        _gdi32.GdiFlush()
+        return np.ctypeslib.as_array(
+            ctypes.cast(bits, ctypes.POINTER(ctypes.c_ubyte * (width * height * 4))).contents
+        ).reshape(height, width, 4).copy()
+    finally:
+        if mem_dc:
+            _gdi32.DeleteDC(mem_dc)
+        _gdi32.DeleteObject(dib)
+        _user32.ReleaseDC(None, screen_dc)
+
+
 def _read_sprite(handle):
-    """读取 HCURSOR 的 32 位 BGRA 位图（含热点）。"""
+    """读取 HCURSOR 位图（含热点）。
+
+    在纯黑 / 纯白两种背景上各画一次再推导 alpha：单色光标、缺少 alpha 通道的
+    早期光标、带 alpha 的现代光标都能正确处理，不会再出现"指针整个消失"。
+    """
     info = ICONINFO()
     if not _user32.GetIconInfo(handle, ctypes.byref(info)):
         return None
     try:
-        if not info.hbmColor:
-            return None  # 老式单色指针，直接用掩码太复杂，跳过
-        bitmap = BITMAP()
-        if not _gdi32.GetObjectW(info.hbmColor, ctypes.sizeof(BITMAP), ctypes.byref(bitmap)):
+        source = info.hbmColor or info.hbmMask
+        if not source:
             return None
-        width, height = int(bitmap.bmWidth), int(bitmap.bmHeight)
+        bitmap = BITMAP()
+        if not _gdi32.GetObjectW(source, ctypes.sizeof(BITMAP), ctypes.byref(bitmap)):
+            return None
+        width = int(bitmap.bmWidth)
+        # 单色光标的掩码位图是 2 倍高（上半 AND、下半 XOR）
+        height = int(bitmap.bmHeight)
+        if not info.hbmColor:
+            height //= 2
         if not (0 < width <= 256 and 0 < height <= 256):
             return None
-        screen_dc = _user32.GetDC(None)
-        mem_dc = _gdi32.CreateCompatibleDC(screen_dc)
-        old = _gdi32.SelectObject(mem_dc, info.hbmColor)
-        header = BITMAPINFOHEADER()
-        header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        header.biWidth = width
-        header.biHeight = -height
-        header.biPlanes = 1
-        header.biBitCount = 32
-        header.biCompression = BI_RGB
-        buffer = (ctypes.c_ubyte * (width * height * 4))()
-        got = _gdi32.GetDIBits(mem_dc, info.hbmColor, 0, height, buffer,
-                               ctypes.byref(header), DIB_RGB_COLORS)
-        _gdi32.SelectObject(mem_dc, old)
-        _gdi32.DeleteDC(mem_dc)
-        _user32.ReleaseDC(None, screen_dc)
-        if not got:
+        on_black = _draw_on(handle, width, height, 0)
+        if on_black is None:
             return None
-        sprite = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 4).copy()
-        if int(sprite[:, :, 3].max()) == 0:
-            return None  # 没有 alpha 信息的旧指针，避免画成黑块
+        on_white = _draw_on(handle, width, height, 255)
+        if on_white is None:
+            return None
+        black = on_black[:, :, :3].astype(np.int16)
+        white = on_white[:, :, :3].astype(np.int16)
+        # 背景可见的地方两次绘制结果不同 → 该处透明
+        alpha = np.clip(255 - (white - black).max(axis=2), 0, 255).astype(np.uint8)
+        sprite = np.zeros((height, width, 4), dtype=np.uint8)
+        sprite[:, :, 3] = alpha
+        opaque = alpha > 0
+        if opaque.any():
+            value = on_black[:, :, :3].astype(np.float32) * 255.0 / np.maximum(alpha, 1)[..., None]
+            sprite[:, :, :3] = np.clip(value, 0, 255).astype(np.uint8)
+        if not opaque.any():
+            return None
         return sprite, (int(info.xHotspot), int(info.yHotspot))
     finally:
         if info.hbmColor:

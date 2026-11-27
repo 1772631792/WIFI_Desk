@@ -433,7 +433,8 @@ class ClientHandler:
             return True
         try:
             tx.send(encoded.data, keyframe=encoded.keyframe,
-                    frame_id=self.media_frame_id)
+                    frame_id=self.media_frame_id,
+                    cursor=getattr(screen, "cursor_visible", True))
         except OSError as exc:
             self._media_off(f"视频发送失败：{exc}")
             return True
@@ -935,6 +936,7 @@ class ClientSession(QObject):
     log = Signal(str)
     file_progress = Signal(dict)
     clipboard_text = Signal(str)
+    cursor_visible = Signal(bool)
 
     def __init__(self, config, device: dict, quality: str = "auto", parent=None,
                  resume_token: str = ""):
@@ -1152,7 +1154,8 @@ class ClientSession(QObject):
                 key, nonce, w, h, epoch,
                 on_frame=self._on_media_rgb, on_snapshot=self._on_media_rgb,
                 on_keyframe=self._media_key, sock=sock, peer=(ip, port),
-                codec=str(info.get("codec", "h264") or "h264"))
+                codec=str(info.get("codec", "h264") or "h264"),
+                on_cursor=self._on_cursor)
             self.media_epoch = epoch
             rx.start()
         except Exception as exc:
@@ -1180,6 +1183,13 @@ class ClientSession(QObject):
 
     def _media_key(self):
         self._send("MEDIA_KEY", priority=True)
+
+    def _on_cursor(self, visible: bool):
+        """远端指针是否已画在画面里；不可见时主控端要显示自己的箭头。"""
+        try:
+            self.cursor_visible.emit(bool(visible))
+        except RuntimeError:
+            pass
 
     def _on_media_rgb(self, rgb):
         if rgb is None:

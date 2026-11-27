@@ -1,7 +1,68 @@
 """WiFiDesk 启动入口：python main.py"""
 import argparse
+import faulthandler
 import os
 import sys
+import threading
+import time
+import traceback
+
+_CRASH_LOG = None
+
+
+def crash_log_path() -> str:
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "WiFiDesk", "crash.log")
+
+
+def _write_crash(title: str, text: str) -> None:
+    """崩溃信息写文件：窗口模式下没有控制台，不看日志什么都查不到。"""
+    path = crash_log_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {title}\n{text}\n")
+    except OSError:
+        pass
+
+
+def install_crash_handlers() -> None:
+    """接管 Python 异常、子线程异常、Qt 警告，并用 faulthandler 兜住原生崩溃。"""
+    global _CRASH_LOG
+    try:
+        os.makedirs(os.path.dirname(crash_log_path()), exist_ok=True)
+        _CRASH_LOG = open(crash_log_path(), "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_CRASH_LOG, all_threads=True)
+    except Exception:
+        _CRASH_LOG = None
+
+    def hook(exc_type, exc, tb):
+        _write_crash("未捕获异常", "".join(traceback.format_exception(exc_type, exc, tb)))
+        if _CRASH_LOG is not None:
+            try:
+                traceback.print_exception(exc_type, exc, tb, file=_CRASH_LOG)
+            except Exception:
+                pass
+
+    sys.excepthook = hook
+
+    def thread_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        hook(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = thread_hook
+
+    try:
+        from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+
+        def qt_handler(mode, _context, message):
+            if mode in (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+                _write_crash(f"Qt 消息({int(mode)})", message)
+
+        qInstallMessageHandler(qt_handler)
+    except Exception:
+        pass
 
 
 def _report(line: str) -> None:
@@ -67,24 +128,29 @@ def main() -> int:
     _ = parser.add_argument("--self-test", action="store_true", help="不启动界面，检查基础能力")
     args = parser.parse_args()
 
+    install_crash_handlers()
     from wd.wd_config import Config
     config = Config()
 
     if args.self_test:
         return self_test()
 
-    from PySide6.QtGui import QIcon
-    from PySide6.QtWidgets import QApplication
-    import wd.wd_theme as wd_theme
-    from wd.wd_ui import MainWindow
+    try:
+        from PySide6.QtGui import QIcon
+        from PySide6.QtWidgets import QApplication
+        import wd.wd_theme as wd_theme
+        from wd.wd_ui import MainWindow
 
-    app = QApplication(sys.argv)
-    app.setApplicationName("WiFiDesk")
-    app.setWindowIcon(QIcon(resource_path("icon.png")))
-    wd_theme.apply_theme(app, str(config.get("theme", "dark")))
-    window = MainWindow(config)
-    window.show()
-    return app.exec()
+        app = QApplication(sys.argv)
+        app.setApplicationName("WiFiDesk")
+        app.setWindowIcon(QIcon(resource_path("icon.png")))
+        wd_theme.apply_theme(app, str(config.get("theme", "dark")))
+        window = MainWindow(config)
+        window.show()
+        return app.exec()
+    except Exception:
+        _write_crash("启动失败", traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
