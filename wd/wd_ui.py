@@ -2,8 +2,9 @@
 import os
 import subprocess
 import threading
+import time
 
-from PySide6.QtCore import Qt, QEvent, Signal, QTimer, QPropertyAnimation
+from PySide6.QtCore import Qt, QEvent, QSize, Signal, QTimer, QPropertyAnimation
 from PySide6.QtGui import QImage, QPixmap, QColor, QCursor, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -261,6 +262,51 @@ class SettingsDialog(QDialog):
         super().accept()
 
 
+try:  # 只在真正显示画面时才需要，缺了也不该影响主界面启动
+    import cv2
+    import numpy as np
+except Exception:  # pragma: no cover
+    cv2 = None
+    np = None
+
+
+def _display_pixmap(img: QImage, logical: QSize, dpr: float, sharpen: bool = True) -> QPixmap:
+    """把解码帧缩放到显示尺寸。
+
+    远程画面被缩小显示时，H.264 解码本身偏软，再叠一次双线性重采样，
+    小字边缘就被抹平了——看起来就是"糊"。这里改成面积平均缩放（保留更多
+    高频细节）并补一档轻度锐化，同样的带宽下文字会干净不少。
+    """
+    if logical.width() <= 0 or logical.height() <= 0:
+        return QPixmap.fromImage(img)
+    target = QSize(max(1, int(round(logical.width() * dpr))),
+                   max(1, int(round(logical.height() * dpr))))
+    shrink = target.width() < img.width() - 2 or target.height() < img.height() - 2
+    pix = None
+    if shrink and cv2 is not None and np is not None and img.format() == QImage.Format_RGB888:
+        try:
+            rows = np.frombuffer(img.constBits(), dtype=np.uint8).reshape(
+                img.height(), img.bytesPerLine())
+            src = rows[:, : img.width() * 3].reshape(img.height(), img.width(), 3)
+            small = cv2.resize(src, (target.width(), target.height()),
+                               interpolation=cv2.INTER_AREA)
+            amount = min(0.5, 0.15 + 0.5 * (1.0 - target.width() / max(1, img.width())))
+            if sharpen and amount > 0.05:
+                blur = cv2.GaussianBlur(small, (0, 0), 0.8)
+                small = cv2.addWeighted(small, 1.0 + amount, blur, -amount, 0)
+            view = QImage(small.data, target.width(), target.height(),
+                          target.width() * 3, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(view)
+        except Exception:
+            pix = None
+    if pix is None:
+        pix = QPixmap.fromImage(
+            img.scaled(target, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+    # 标明物理像素比，避免系统再做一次放大（高 DPI 下这是最常见的发糊原因）。
+    pix.setDevicePixelRatio(dpr)
+    return pix
+
+
 class RemoteView(QLabel):
     def __init__(self, owner):
         super().__init__()
@@ -304,6 +350,7 @@ class RemoteWindow(QWidget):
         self.device = device
         self.config = config
         self.canvas = QImage()
+        self._last_view_at = 0.0
         self.scale = 1.0
         self.offset = (0, 0)
         self.zoom = "fit"
@@ -322,15 +369,20 @@ class RemoteWindow(QWidget):
             remote_w, remote_h = 1280, 720
         screen = QGuiApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else None
-        full_w, full_h = remote_w + 32, remote_h + 96
-        if avail and full_w <= avail.width() and full_h <= avail.height():
-            self.zoom = "one"
-            win_w, win_h = full_w, full_h
+        # 窗口尽量开满可用区域：缩放比例越接近 1:1，远处画面就越清楚。
+        # 以前固定封顶 1600x1000，1080p 被控端只能缩到 0.8 左右，文字明显发虚。
+        toolbar_h, frame_h = 48, 32
+        if avail is not None:
+            max_w = max(640, avail.width() - 8)
+            max_h = max(420, avail.height() - frame_h - 4)
         else:
-            limit_w = 1600 if avail is None else min(1600, avail.width() - 80)
-            limit_h = 1000 if avail is None else min(1000, avail.height() - 80)
-            factor = min(1.0, max(0.4, min(limit_w / full_w, limit_h / full_h)))
-            win_w, win_h = max(900, int(full_w * factor)), max(600, int(full_h * factor))
+            max_w, max_h = 1920, 1080
+        factor = min(1.0, (max_w - 2) / remote_w, (max_h - toolbar_h) / remote_h)
+        factor = max(0.4, factor)
+        if factor >= 0.999:
+            self.zoom = "one"
+        win_w = max(900, int(round(remote_w * factor)) + 2)
+        win_h = max(600, int(round(remote_h * factor)) + toolbar_h)
         self.resize(win_w, win_h)
         self._build()
         self.zoom_combo.setCurrentIndex(1 if self.zoom == "one" else 0)
@@ -450,15 +502,19 @@ class RemoteWindow(QWidget):
         area = self.view.size()
         if area.width() < 8 or area.height() < 8:
             return
-        if self.zoom == "one":
-            target = self.canvas.size()
-            pix = QPixmap.fromImage(self.canvas)
-        else:
-            target = self.canvas.size().scaled(area, Qt.KeepAspectRatio)
-            pix = QPixmap.fromImage(self.canvas).scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        dpr = max(1.0, self.view.devicePixelRatioF())
+        logical = (self.canvas.size() if self.zoom == "one"
+                   else self.canvas.size().scaled(area, Qt.KeepAspectRatio))
+        now = time.perf_counter()
+        interval = now - self._last_view_at
+        self._last_view_at = now
+        # 60 FPS 档省掉锐化：画面在动时流畅比边缘更重要，也避免占满 UI 线程。
+        pix = _display_pixmap(self.canvas, logical, dpr, sharpen=interval > 0.022)
         self.view.setPixmap(pix)
-        self.scale = pix.width() / max(1, self.canvas.width())
-        self.offset = ((area.width() - pix.width()) // 2, (area.height() - pix.height()) // 2)
+        shown_w = pix.width() / dpr
+        shown_h = pix.height() / dpr
+        self.scale = shown_w / max(1, self.canvas.width())
+        self.offset = ((area.width() - shown_w) / 2.0, (area.height() - shown_h) / 2.0)
 
     def native_pos(self, pos):
         if self.canvas.isNull():

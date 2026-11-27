@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover - 缺少 OpenCV 时退回 swscale
 
 CANDIDATES = {
     "h264": (
-        ("h264_nvenc", True, {"preset": "p1", "tune": "ull", "zerolatency": "1", "delay": "0"}),
+        ("h264_nvenc", True, {"preset": "p4", "tune": "ull", "zerolatency": "1", "delay": "0"}),
         ("h264_qsv", True, {"preset": "veryfast", "async_depth": "1", "low_delay_brc": "1"}),
         ("h264_amf", True, {"usage": "ultralowlatency", "quality": "speed"}),
         ("libx264", False, {"preset": "veryfast", "tune": "zerolatency"}),

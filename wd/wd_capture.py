@@ -108,7 +108,8 @@ class AdaptiveQuality:
         self.params["zlib_level"] = 1 if self.level < 0.8 else base["zlib_level"]
         self.params["bitrate"] = max(1_500_000, int(base["bitrate"] * (0.55 + 0.45 * self.level)))
         # 链路变差时放宽 CRF（牺牲细节换码率），而不是一刀切降分辨率。
-        self.params["crf"] = int(round(min(34, base.get("crf", 20) + (1.0 - self.level) * 10)))
+        # 幅度要克制：CRF 一涨，静态文字就整片发糊，而远程桌面绝大部分时间看的正是静态字。
+        self.params["crf"] = int(round(min(30, base.get("crf", 20) + (1.0 - self.level) * 4)))
 
 
 class ScreenCapture:
