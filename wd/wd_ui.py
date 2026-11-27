@@ -1,4 +1,5 @@
 """PySide6 主界面：设备发现、配对授权、设置与远程窗口。"""
+import collections
 import os
 import subprocess
 import threading
@@ -368,6 +369,13 @@ class RemoteWindow(QWidget):
         self._prev_zoom = "fit"
         self.remote_size = (1280, 720)
         self.pressed_keys = set()
+        self._down_vks = set()
+        self._key_queue = collections.deque()
+        self._grab = None
+        self._key_timer = QTimer(self)
+        self._key_timer.setInterval(8)
+        self._key_timer.timeout.connect(self._drain_keys)
+        self._key_timer.start()
         self.reconnect_attempts = 0
         self.reconnect_timer = QTimer(self)
         self.reconnect_timer.setSingleShot(True)
@@ -415,7 +423,13 @@ class RemoteWindow(QWidget):
         if self.zoom == "width":
             # 桌面级分辨率开满窗口：宽度基本就是 1:1，文字不再被整体缩小。
             self.showMaximized()
+        self._start_key_grab()
         self.set_frame()
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.ActivationChange:
+            self._update_grab_active()
+        super().changeEvent(event)
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -455,6 +469,7 @@ class RemoteWindow(QWidget):
         free_btn = QPushButton("释放键鼠")
         free_btn.clicked.connect(self.release_all)
         self.full_btn = QPushButton("全屏")
+        self.full_btn.setToolTip("全屏后所有按键都发给远端；紧急释放键盘：Ctrl+Alt+Shift+Q")
         self.full_btn.clicked.connect(self.toggle_fullscreen)
         close_btn = QPushButton("断开")
         close_btn.setObjectName("danger")
@@ -489,7 +504,7 @@ class RemoteWindow(QWidget):
         self.mini_label = QLabel("已连接")
         mini_row.addWidget(self.mini_label)
         mini_exit = QPushButton("退出全屏")
-        mini_exit.setToolTip("Esc")
+        mini_exit.setToolTip("Esc 已转发给远端；紧急释放键盘：Ctrl+Alt+Shift+Q")
         mini_exit.clicked.connect(self.toggle_fullscreen)
         mini_close = QPushButton("断开")
         mini_close.clicked.connect(self.close)
@@ -654,19 +669,11 @@ class RemoteWindow(QWidget):
             self.client.send_input({"a": "wheel", "delta": 120 if delta > 0 else -120})
 
     def key_press(self, event):
-        if event.key() == Qt.Key_Escape and self.isFullScreen():
-            self.toggle_fullscreen()
-            return
-        if event.key() == Qt.Key_V and (event.modifiers() & Qt.ControlModifier):
-            # 粘贴前把本机剪贴板文本推过去，被控端才能粘贴到本机复制的内容。
-            self.client.push_clipboard()
-        if event.key() in (Qt.Key_C, Qt.Key_X) and (event.modifiers() & Qt.ControlModifier):
-            # 复制/剪切后把被控端的剪贴板取回来，本地也能粘贴。
-            self.client.request_clipboard()
+        if self._grab is not None and self._grab.active:
+            return      # 键盘已由低级钩子接管，避免重复发送
         vk = qt_key_to_vk(event.key(), event.text())
         if vk:
-            self.pressed_keys.add(vk)
-            self.client.send_input({"a": "key", "vk": vk, "down": True})
+            self._handle_remote_key(vk, True)
 
     def on_cursor_visible(self, visible: bool):
         # 有本地指针位图时隐藏系统箭头，避免两个指针叠在一起。
@@ -734,14 +741,74 @@ class RemoteWindow(QWidget):
             super().dropEvent(event)
 
     def key_release(self, event):
+        if self._grab is not None and self._grab.active:
+            return
         vk = qt_key_to_vk(event.key(), event.text())
         if vk:
-            self.pressed_keys.discard(vk)
-            self.client.send_input({"a": "key", "vk": vk, "down": False})
+            self._handle_remote_key(vk, False)
 
     def release_all(self):
         self.pressed_keys.clear()
+        self._down_vks.clear()
         self.client.send_input({"a": "reset"})
+
+    # ---- 键盘抓取 -------------------------------------------------------
+    def _start_key_grab(self):
+        if self._grab is not None:
+            return
+        try:
+            from .wd_keyhook import KeyboardGrab
+            self._grab = KeyboardGrab(self._enqueue_key)
+            self._grab.start()
+        except Exception:
+            self._grab = None
+        self._update_grab_active()
+
+    def _enqueue_key(self, vk: int, down: bool, extended: bool):
+        # 运行在钩子线程：只入队，实际发送在界面线程做
+        self._key_queue.append((vk, down, extended))
+
+    def _update_grab_active(self):
+        if self._grab is None:
+            return
+        want = (self.isVisible() and not self.isMinimized() and self.isActiveWindow()
+                and self.client is not None)
+        if want == self._grab.active:
+            return
+        if not want:
+            self.release_all()
+        self._grab.set_active(want)
+
+    def _drain_keys(self):
+        while self._key_queue:
+            vk, down, ext = self._key_queue.popleft()
+            self._handle_remote_key(vk, down, ext)
+
+    def _handle_remote_key(self, vk: int, down: bool, ext: bool = False):
+        if not vk:
+            return
+        ctrl = bool(self._down_vks & {0x11, 0xA2, 0xA3})
+        # Ctrl+Alt+Shift+Q：本机保留的"松手"组合，退出全屏并释放键盘
+        if (down and vk == 0x51 and ctrl
+                and self._down_vks & {0x12, 0xA4, 0xA5}
+                and self._down_vks & {0x10, 0xA0, 0xA1}):
+            if self.isFullScreen():
+                self.toggle_fullscreen()
+            if self._grab is not None:
+                self._grab.set_active(False)
+            self.release_all()
+            return
+        if down:
+            if ctrl and vk in (0x43, 0x58):      # Ctrl+C / Ctrl+X
+                self.client.request_clipboard()
+            elif ctrl and vk == 0x56:            # Ctrl+V
+                self.client.push_clipboard()
+            self._down_vks.add(vk)
+            self.pressed_keys.add(vk)
+        else:
+            self._down_vks.discard(vk)
+            self.pressed_keys.discard(vk)
+        self.client.send_input({"a": "key", "vk": vk, "down": down, "ext": ext})
 
     def _peek_toolbar(self):
         if not self.isFullScreen():
@@ -876,6 +943,10 @@ class RemoteWindow(QWidget):
 
     def closeEvent(self, event):
         self.reconnect_timer.stop()
+        self._key_timer.stop()
+        if self._grab is not None:
+            self._grab.stop()
+            self._grab = None
         self.release_all()
         self.client.stop()
         super().closeEvent(event)

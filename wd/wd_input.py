@@ -20,6 +20,7 @@ MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_WHEEL = 0x0800
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_EXTENDEDKEY = 0x0001
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -93,12 +94,15 @@ def mouse_wheel(delta: int):
     return _send(i)
 
 
-def key(vk: int, down: bool):
+def key(vk: int, down: bool, extended: bool = False):
     if not vk:
         return 0
     i = INPUT(type=INPUT_KEYBOARD)
     i.ki.wVk = WORD(vk & 0xFF)
-    i.ki.dwFlags = 0 if down else KEYEVENTF_KEYUP
+    flags = 0 if down else KEYEVENTF_KEYUP
+    if extended:
+        flags |= KEYEVENTF_EXTENDEDKEY
+    i.ki.dwFlags = flags
     return _send(i)
 
 
@@ -113,7 +117,8 @@ def inject(event: dict):
     if action == "wheel":
         return mouse_wheel(int(event.get("delta", 0)))
     if action == "key":
-        return key(int(event.get("vk", 0)), bool(event.get("down", True)))
+        return key(int(event.get("vk", 0)), bool(event.get("down", True)),
+                   bool(event.get("ext", False)))
     if action == "reset":
         for b in ("left", "middle", "right"):
             mouse_button(b, False)
@@ -170,7 +175,11 @@ def encode_event(event: dict) -> bytes:
         return b"W" + struct.pack(">h", delta)
     if action == "key":
         vk = int(event.get("vk", 0)) & 0xFF
-        return b"K" + bytes((vk, 1 if event.get("down", True) else 0))
+        down = 1 if event.get("down", True) else 0
+        # 扩展键单独用一个类型字节：老版本收到不认识的 "E" 只会忽略该键，
+        # 不会因为解析错位导致远端按键卡住。
+        kind = b"E" if event.get("ext") else b"K"
+        return kind + bytes((vk, down))
     if action == "reset":
         return b"R"
     return b""
@@ -188,8 +197,9 @@ def decode_event(data: bytes) -> dict:
         return {"a": "down" if data[2] else "up", "button": name}
     if kind == b"W" and len(data) == 3:
         return {"a": "wheel", "delta": struct.unpack(">h", data[1:])[0]}
-    if kind == b"K" and len(data) == 3:
-        return {"a": "key", "vk": data[1], "down": bool(data[2])}
+    if kind in (b"K", b"E") and len(data) == 3:
+        return {"a": "key", "vk": data[1], "down": bool(data[2]),
+                "ext": kind == b"E"}
     if kind == b"R":
         return {"a": "reset"}
     return {}
