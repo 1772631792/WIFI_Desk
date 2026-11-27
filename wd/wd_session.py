@@ -44,6 +44,14 @@ def _capture():
     return wd_capture
 
 
+def _tune_tcp(sock):
+    """关掉 Nagle：键鼠是高频小包，攒包会让远端操作明显发涩。"""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+
 class ServerSession(QObject):
     auth_required = Signal(dict)
     session_started = Signal(dict)
@@ -206,6 +214,7 @@ class ClientHandler:
         self._media_frames_last = 0
         # 编码吃力时按 25% 台阶降低编码分辨率，画面由主控端放大显示。
         self.encode_scale = 1.0
+        self.encode_fast = False
         self.enc_ema = 0.0
         self.grab_ema = 0.0
         self._slow_streak = 0
@@ -341,6 +350,20 @@ class ClientHandler:
         if encoder:
             encoder.request_keyframe()
 
+    def _reply_clipboard(self):
+        # 对端按下 Ctrl+C 后，被控端的应用程序写入剪贴板是异步的：分几次重读。
+        text = ""
+        for delay in (0.06, 0.08, 0.12, 0.2):
+            time.sleep(delay)
+            try:
+                text = wd_clipboard.get_text()
+            except Exception:
+                text = ""
+            if text:
+                break
+        if text:
+            self._send("CLIP_TEXT", text.encode("utf-8"), priority=True)
+
     def _send_video(self, screen, cur) -> bool:
         with self.capture_lock:
             fps = max(1, int(self.qos.params["fps"]))
@@ -353,7 +376,8 @@ class ClientHandler:
             stale = (self.encoder is None
                      or self.encoder.width != ew
                      or self.encoder.height != eh
-                     or abs(self.encoder.fps - fps) >= 5)
+                     or abs(self.encoder.fps - fps) >= 5
+                     or self.encoder.fast != self.encode_fast)
             if stale:
                 old, self.encoder = self.encoder, None
                 previous = self.family
@@ -363,7 +387,7 @@ class ClientHandler:
                 # 重建时沿用已选定的编码器，不再重新跑基准（那会卡住画面几百毫秒）。
                 encoder = wd_codec.H264Encoder(
                     ew, eh, fps, bitrate, codec=self.force_codec or (old.name if old else ""),
-                    crf=crf, family=self.family)
+                    crf=crf, family=self.family, fast=self.encode_fast)
                 self.encoder = encoder
                 self.family = encoder.family
                 if encoder.family != previous:
@@ -514,6 +538,17 @@ class ClientHandler:
                             pass
                     self._slow_streak = 0
                     self.server.log.emit("H.265 编码跟不上帧率，改用 H.264（保持分辨率）")
+                elif not self.encode_fast:
+                    # 换更快的编码预设，画质略降但分辨率不变，比放大 540p 清楚得多。
+                    self.encode_fast = True
+                    old, self.encoder = self.encoder, None
+                    if old:
+                        try:
+                            old.close()
+                        except Exception:
+                            pass
+                    self._slow_streak = 0
+                    self.server.log.emit("编码跟不上帧率，改用更快预设（保持分辨率）")
                 elif self.encode_scale > 0.5:
                     self.encode_scale = max(0.5, self.encode_scale - 0.25)
                     self._slow_streak = 0
@@ -597,6 +632,7 @@ class ClientHandler:
             send_msg(self.sock, "TLS_READY", cert=self.server.config.cert_pem)
             self.sock = ctx.wrap_socket(self.sock, server_side=True)
             self.sock.setblocking(True)
+            _tune_tcp(self.sock)
             peer_der = self.sock.getpeercert(binary_form=True)
             if wd_crypto.fingerprint(peer_der or b"") != actual:
                 raise ValueError("TLS 客户端证书与声明不一致")
@@ -813,10 +849,15 @@ class ClientHandler:
             except (OSError, ValueError) as exc:
                 self.server.log.emit(f"被控接收结束：{type(exc).__name__}: {exc}")
                 break
-            if typ == "INPUT":
+            if typ in ("INPUT", "INPUT2"):
                 try:
-                    wd_input.inject(json.loads(payload.decode("utf-8")))
-                except (ValueError, UnicodeDecodeError):
+                    if typ == "INPUT2":
+                        event = wd_input.decode_event(payload)
+                    else:
+                        event = json.loads(payload.decode("utf-8"))
+                    if event:
+                        wd_input.inject(event)
+                except Exception:
                     pass
             elif typ == "PING":
                 try:
@@ -835,6 +876,9 @@ class ClientHandler:
                     threading.Thread(target=wd_clipboard.set_text, args=(text,),
                                      daemon=True, name="wd-clip").start()
                     self.server.log.emit(f"已同步剪贴板文本（{len(text)} 字）")
+            elif typ == "CLIP_GET":
+                threading.Thread(target=self._reply_clipboard, daemon=True,
+                                 name="wd-clip-get").start()
             elif typ == "FILE_BEGIN":
                 self._file_begin(meta)
             elif typ == "FILE_CHUNK":
@@ -872,6 +916,7 @@ class ClientSession(QObject):
     state = Signal(str)
     log = Signal(str)
     file_progress = Signal(dict)
+    clipboard_text = Signal(str)
 
     def __init__(self, config, device: dict, quality: str = "auto", parent=None,
                  resume_token: str = ""):
@@ -904,8 +949,11 @@ class ClientSession(QObject):
         self.media_epoch = 0
         self.codec_name = ""
         self.remote_size = (0, 0)
+        self.stream_size = (0, 0)
         self._media_bytes_last = 0
         self._clip_last = ""
+        # 剪贴板只能在 GUI 线程改，接收线程通过信号转回来。
+        self.clipboard_text.connect(self._apply_clipboard)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True, name="wd-controller").start()
@@ -941,7 +989,20 @@ class ClientSession(QObject):
                 return False
 
     def send_input(self, event: dict):
-        self._send("INPUT", json.dumps(event).encode("utf-8"), priority=True)
+        blob = wd_input.encode_event(event)
+        if blob:
+            self._send("INPUT2", blob, priority=True)
+
+    def request_clipboard(self) -> bool:
+        """Ctrl+C/X 时向被控端要一次剪贴板文本，让本地也能粘贴远端复制的内容。"""
+        return self._send("CLIP_GET", priority=True)
+
+    def _apply_clipboard(self, text: str):
+        from PySide6.QtGui import QGuiApplication
+        if not text or text == self._clip_last:
+            return
+        self._clip_last = text
+        QGuiApplication.clipboard().setText(text)
 
     def push_clipboard(self) -> bool:
         """把本机剪贴板文本推到被控端，被控端据此设置自己的剪贴板。"""
@@ -1109,6 +1170,7 @@ class ClientSession(QObject):
         if width <= 0 or height <= 0:
             return
         stride = int(rgb.strides[0]) if rgb.ndim == 3 else width * 3
+        self.stream_size = (width, height)
         img = QImage(rgb.data, width, height, stride, QImage.Format_RGB888).copy()
         if img.isNull():
             return
@@ -1151,6 +1213,7 @@ class ClientSession(QObject):
             ctx = wd_crypto.tls_context(wd_config.APP_DIR, False, peer_pem=server_pem)
             self.sock = ctx.wrap_socket(self.sock, server_hostname=None)
             self.sock.setblocking(True)
+            _tune_tcp(self.sock)
             actual = wd_crypto.fingerprint(self.sock.getpeercert(binary_form=True) or b"")
             if actual != expected:
                 raise ValueError("TLS 服务端证书校验失败")
@@ -1256,6 +1319,10 @@ class ClientSession(QObject):
                 self._stop_media()
                 self.mode = "图块回退"
                 self.log.emit(f"视频通道停用，切回图块：{meta.get('reason', '')}")
+            elif typ == "CLIP_TEXT":
+                text = payload.decode("utf-8", "ignore")
+                if text:
+                    self.clipboard_text.emit(text)
             elif typ == "MEDIA_CODEC":
                 codec = str(meta.get("codec", "h264"))
                 if self.media and codec != self.codec_name:
@@ -1349,6 +1416,8 @@ class ClientSession(QObject):
             "dec": round(dec, 1),
             "w": self.remote_size[0] or (self.canvas.width() if self.canvas else 0),
             "h": self.remote_size[1] or (self.canvas.height() if self.canvas else 0),
+            "sw": self.stream_size[0],
+            "sh": self.stream_size[1],
         })
         self.frames = 0
         self.bytes_frame = 0

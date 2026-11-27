@@ -269,6 +269,9 @@ class RemoteView(QLabel):
         self.setStyleSheet("background:#000000;")
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
+        # 指到画面里就藏掉本地箭头：远端画面里已经画了它自己的指针，
+        # 两个箭头错位看着很难受。
+        self.setCursor(Qt.BlankCursor)
 
     def mousePressEvent(self, event):
         self.owner.mouse_press(event)
@@ -501,6 +504,9 @@ class RemoteWindow(QWidget):
         if event.key() == Qt.Key_V and (event.modifiers() & Qt.ControlModifier):
             # 粘贴前把本机剪贴板文本推过去，被控端才能粘贴到本机复制的内容。
             self.client.push_clipboard()
+        if event.key() in (Qt.Key_C, Qt.Key_X) and (event.modifiers() & Qt.ControlModifier):
+            # 复制/剪切后把被控端的剪贴板取回来，本地也能粘贴。
+            self.client.request_clipboard()
         vk = qt_key_to_vk(event.key(), event.text())
         if vk:
             self.pressed_keys.add(vk)
@@ -592,9 +598,15 @@ class RemoteWindow(QWidget):
         qf = int(data.get("qf", 0) or 0)
         codec = str(data.get("codec", "") or "")
         detail = f" · {codec}" if codec else ""
+        remote_w, remote_h = int(data.get("w", 0) or 0), int(data.get("h", 0) or 0)
+        stream_w, stream_h = int(data.get("sw", 0) or 0), int(data.get("sh", 0) or 0)
+        # 服务端降了编码分辨率就直接标出来，否则用户只会觉得"莫名很糊"。
+        scale_txt = ""
+        if stream_w and remote_w and stream_w < remote_w:
+            scale_txt = f"（画面 {stream_w}×{stream_h}）"
         self.mode_label.setText(
             f"模式：{data.get('mode', '-')}{detail} · {data.get('fps', 0)} FPS · "
-            f"{data.get('w', 0)}×{data.get('h', 0)} · 自适应 {qos_pct}%"
+            f"{remote_w}×{remote_h}{scale_txt} · 自适应 {qos_pct}%"
         )
         dec = float(data.get("dec", 0) or 0)
         dec_txt = f"   解码 {dec:.0f} ms" if dec else ""

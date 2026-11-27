@@ -1,5 +1,6 @@
 """Windows SendInput 注入；仅在远程窗口获得焦点时调用。"""
 import ctypes
+import struct
 from ctypes import wintypes
 
 LONG = ctypes.c_long
@@ -124,6 +125,13 @@ def inject(event: dict):
 
 def qt_key_to_vk(key: int, text: str = "") -> int:
     from PySide6.QtCore import Qt
+    # 字母/数字键：Qt 的键值本身就是 ASCII（Key_A == 0x41）。
+    # 必须先按 key 判断——按住 Ctrl 时 event.text() 是控制字符（如 \x03），
+    # 旧实现靠 text 取字符会返回 0，导致 Ctrl+C/V/A/Z 这类快捷键全部失效。
+    if Qt.Key_A <= key <= Qt.Key_Z:
+        return int(key)
+    if Qt.Key_0 <= key <= Qt.Key_9:
+        return int(key)
     special = {
         Qt.Key_Escape: 0x1B, Qt.Key_Tab: 0x09, Qt.Key_Backspace: 0x08,
         Qt.Key_Return: 0x0D, Qt.Key_Enter: 0x0D, Qt.Key_Shift: 0x10,
@@ -131,19 +139,57 @@ def qt_key_to_vk(key: int, text: str = "") -> int:
         Qt.Key_CapsLock: 0x14, Qt.Key_Space: 0x20, Qt.Key_PageUp: 0x21,
         Qt.Key_PageDown: 0x22, Qt.Key_End: 0x23, Qt.Key_Home: 0x24,
         Qt.Key_Left: 0x25, Qt.Key_Up: 0x26, Qt.Key_Right: 0x27, Qt.Key_Down: 0x28,
-        Qt.Key_Insert: 0x2D, Qt.Key_Delete: 0x2E,
+        Qt.Key_Insert: 0x2D, Qt.Key_Delete: 0x2E, Qt.Key_Menu: 0x5D,
+        Qt.Key_Print: 0x2C, Qt.Key_ScrollLock: 0x91, Qt.Key_Pause: 0x13,
         Qt.Key_F1: 0x70, Qt.Key_F2: 0x71, Qt.Key_F3: 0x72, Qt.Key_F4: 0x73,
         Qt.Key_F5: 0x74, Qt.Key_F6: 0x75, Qt.Key_F7: 0x76, Qt.Key_F8: 0x77,
         Qt.Key_F9: 0x78, Qt.Key_F10: 0x79, Qt.Key_F11: 0x7A, Qt.Key_F12: 0x7B,
         Qt.Key_Semicolon: 0xBA, Qt.Key_Equal: 0xBB, Qt.Key_Comma: 0xBC,
         Qt.Key_Minus: 0xBD, Qt.Key_Period: 0xBE, Qt.Key_Slash: 0xBF,
         Qt.Key_BracketLeft: 0xDB, Qt.Key_Backslash: 0xDC, Qt.Key_BracketRight: 0xDD,
-        Qt.Key_QuoteLeft: 0xC0,
+        Qt.Key_QuoteLeft: 0xC0, Qt.Key_Plus: 0xBB,
     }
-    if key in special:
-        return special[key]
-    if text and len(text) == 1:
-        ch = text.upper()
-        if "A" <= ch <= "Z" or "0" <= ch <= "9":
-            return ord(ch)
-    return 0
+    return special.get(key, 0)
+
+
+_MOUSE_BUTTON_ID = {"left": 0, "middle": 1, "right": 2}
+
+
+def encode_event(event: dict) -> bytes:
+    """紧凑二进制输入：比 JSON 少一半字节，解析成本几乎为零。"""
+    action = event.get("a")
+    if action == "move":
+        x = int(max(0.0, min(1.0, float(event.get("nx", 0.0)))) * 65535)
+        y = int(max(0.0, min(1.0, float(event.get("ny", 0.0)))) * 65535)
+        return b"M" + struct.pack(">HH", x, y)
+    if action in ("down", "up"):
+        button = _MOUSE_BUTTON_ID.get(str(event.get("button", "left")), 0)
+        return b"B" + bytes((button, 1 if action == "down" else 0))
+    if action == "wheel":
+        delta = max(-32768, min(32767, int(event.get("delta", 0))))
+        return b"W" + struct.pack(">h", delta)
+    if action == "key":
+        vk = int(event.get("vk", 0)) & 0xFF
+        return b"K" + bytes((vk, 1 if event.get("down", True) else 0))
+    if action == "reset":
+        return b"R"
+    return b""
+
+
+def decode_event(data: bytes) -> dict:
+    if not data:
+        return {}
+    kind = data[:1]
+    if kind == b"M" and len(data) == 5:
+        x, y = struct.unpack(">HH", data[1:])
+        return {"a": "move", "nx": x / 65535.0, "ny": y / 65535.0}
+    if kind == b"B" and len(data) == 3:
+        name = ("left", "middle", "right")[data[1]] if data[1] < 3 else "left"
+        return {"a": "down" if data[2] else "up", "button": name}
+    if kind == b"W" and len(data) == 3:
+        return {"a": "wheel", "delta": struct.unpack(">h", data[1:])[0]}
+    if kind == b"K" and len(data) == 3:
+        return {"a": "key", "vk": data[1], "down": bool(data[2])}
+    if kind == b"R":
+        return {"a": "reset"}
+    return {}

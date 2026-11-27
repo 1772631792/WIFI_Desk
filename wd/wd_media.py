@@ -478,8 +478,8 @@ class MediaRx:
         with self.decoder_lock:
             if not self.decoder:
                 return
-            if keyframe:
-                self.decoder.reset()
+            # 关键帧不再重建解码器：IDR 本身就能让解码器重置状态，
+            # 每秒重建一次会带来 5~10ms 的停顿，看起来就是周期性的卡一下。
             started = time.perf_counter()
             decoded = self.decoder.decode(payload)
         spent = (time.perf_counter() - started) * 1000.0

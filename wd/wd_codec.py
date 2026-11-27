@@ -172,7 +172,8 @@ def select_encoder(width: int, height: int, fps: int, bitrate: int,
 
 class H264Encoder:
     def __init__(self, width: int, height: int, fps: int = 30, bitrate: int = 8_000_000,
-                 codec: str = "", crf: int = 0, family: str = "auto", sample=None):
+                 codec: str = "", crf: int = 0, family: str = "auto", sample=None,
+                 fast: bool = False):
         self.width = int(width)
         self.height = int(height)
         self.fps = max(1, int(fps))
@@ -188,6 +189,11 @@ class H264Encoder:
         else:
             self.name, self.hardware, self.options, self.family = select_encoder(
                 self.width, self.height, self.fps, self.bitrate, self.crf, family, sample)
+        # 编码跟不上时先换 ultrafast（保住分辨率），比直接降分辨率观感好得多。
+        self.fast = bool(fast and self.name in ("libx264", "libx265"))
+        if self.fast:
+            self.options = dict(self.options)
+            self.options["preset"] = "ultrafast"
         self.ctx = _open_encoder(self.name, self.options, self.width, self.height,
                                  self.fps, self.bitrate, max(1, self.fps), self.crf)
         self.pix_fmt = self.ctx.pix_fmt

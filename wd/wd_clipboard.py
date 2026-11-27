@@ -21,6 +21,35 @@ if _user32:
     _user32.OpenClipboard.argtypes = [wintypes.HWND]
     _user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
     _user32.SetClipboardData.restype = wintypes.HANDLE
+    _user32.GetClipboardData.argtypes = [wintypes.UINT]
+    _user32.GetClipboardData.restype = wintypes.HANDLE
+
+
+def get_text() -> str:
+    """读出本机剪贴板里的 Unicode 文本；不是文本或暂时被占用时返回空串。"""
+    if _user32 is None or _kernel32 is None:
+        return ""
+    opened = False
+    for _ in range(10):
+        if _user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.02)
+    if not opened:
+        return ""
+    try:
+        handle = _user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        pointer = _kernel32.GlobalLock(handle)
+        if not pointer:
+            return ""
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            _kernel32.GlobalUnlock(handle)
+    finally:
+        _user32.CloseClipboard()
 
 
 def set_text(text: str) -> bool:
