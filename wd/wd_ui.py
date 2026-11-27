@@ -403,10 +403,8 @@ class RemoteWindow(QWidget):
         factor = max(0.4, factor)
         if factor >= 0.999:
             self.zoom = "one"
-        elif remote_w >= 1200:
-            # 桌面尺寸的画面默认按宽度 1:1 铺满：文字是原生像素，纵向留一点滚动，
-            # 比整体缩到 0.88 清楚得多（这是"像商业软件"的关键差别）。
-            self.zoom = "width"
+        # 窗口模式默认"适应窗口"：必须整屏可见（含远端任务栏）。
+        # "适应宽度"会让纵向被截掉，只保留为手动选项。
         win_w = max(900, int(round(remote_w * min(1.0, factor))) + 2)
         win_h = max(600, int(round(remote_h * factor)) + toolbar_h)
         self.resize(win_w, win_h)
@@ -420,8 +418,8 @@ class RemoteWindow(QWidget):
         self.client.connected.connect(self._on_reconnected)
         self.client.disconnected.connect(self._on_disconnected)
         self.show()
-        if self.zoom == "width":
-            # 桌面级分辨率开满窗口：宽度基本就是 1:1，文字不再被整体缩小。
+        if remote_w >= 1200 and self.zoom != "one":
+            # 桌面级分辨率开满窗口，缩放交给"适应窗口"：既整屏可见又不浪费屏幕
             self.showMaximized()
         self._start_key_grab()
         self.set_frame()
