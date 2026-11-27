@@ -18,7 +18,7 @@ from .wd_cursor import draw as _draw_cursor
 # crf 为 H.264 恒定质量：ABR 在画面突然变化时会先糊一段，CRF 立刻按内容给足码率。
 PRESETS = {
     "auto": {"tile": 96, "fps": 30, "quality": 93, "dynamic_ratio": 0.55,
-             "full_chroma": True, "zlib_level": 2, "bitrate": 30_000_000, "crf": 20},
+             "full_chroma": True, "zlib_level": 2, "bitrate": 30_000_000, "crf": 19},
     "office": {"tile": 64, "fps": 30, "quality": 96, "dynamic_ratio": 0.80,
                "full_chroma": True, "zlib_level": 3, "bitrate": 20_000_000, "crf": 19},
     "sharp": {"tile": 48, "fps": 30, "quality": 98, "dynamic_ratio": 0.92,

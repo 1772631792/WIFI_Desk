@@ -212,7 +212,8 @@ class ClientHandler:
         self.media_frames = 0
         self._media_bad_last = 0
         self._media_frames_last = 0
-        # 编码吃力时按 25% 台阶降低编码分辨率，画面由主控端放大显示。
+        # 编码吃力时优先降帧率而不是降分辨率：糊了比掉几帧更难受。
+        self.fps_cap = 0        # 0 = 跟随预设，运行时按实测负载下调
         self.encode_scale = 1.0
         self.encode_fast = False
         self.enc_ema = 0.0
@@ -396,7 +397,7 @@ class ClientHandler:
                 self.codec_name = (f"{encoder.name}"
                                    f"{'(硬件)' if encoder.hardware else '(软件)'}")
                 self.server.log.emit(
-                    f"视频编码：{self.codec_name} {ew}x{eh}@{fps}"
+                    f"视频编码：{self.codec_name} {ew}x{eh}@{self._effective_fps()}"
                     + ("" if self.encode_scale >= 1.0 else
                        f"（原画面 {cur.shape[1]}x{cur.shape[0]}，编码降分辨率）"))
             encoder = self.encoder
@@ -516,9 +517,10 @@ class ClientHandler:
             self.qos.observe(self.peer_rtt, pending=pending, dropped=dropped_delta, loss=loss)
             target = int(self.qos.params["bitrate"])
         if self.media_ok and self.enc_ema > 0:
-            budget = 1000.0 / max(1, int(self.qos.base.get("fps", 30)))
+            base_fps = max(15, int(self.qos.params.get("fps", 30)))
+            budget = 1000.0 / max(1, self._effective_fps())
             load = self.enc_ema + self.grab_ema
-            if load > budget * 0.8:
+            if load > budget * 0.9:
                 self._slow_streak += 1
                 self._fast_streak = 0
             elif load < budget * 0.45:
@@ -538,6 +540,13 @@ class ClientHandler:
                             pass
                     self._slow_streak = 0
                     self.server.log.emit("H.265 编码跟不上帧率，改用 H.264（保持分辨率）")
+                elif self._effective_fps() > 30:
+                    # 降帧率比降分辨率划算得多：1080p@30 比放大后的 1440×810 清楚。
+                    current = self._effective_fps()
+                    self.fps_cap = max(30, current - 10)
+                    self._slow_streak = 0
+                    self.server.log.emit(
+                        f"编码跟不上，帧率上限 {current} → {self.fps_cap} FPS（保持分辨率）")
                 elif not self.encode_fast:
                     # 换更快的编码预设，画质略降但分辨率不变，比放大 540p 清楚得多。
                     self.encode_fast = True
@@ -554,11 +563,16 @@ class ClientHandler:
                     self._slow_streak = 0
                     self.server.log.emit(
                         f"采集+编码 {load:.0f}ms 偏高，编码分辨率降到 {int(self.encode_scale * 100)}%（画面由主控端放大）")
-            elif self._fast_streak >= 8 and self.encode_scale < 1.0:
-                self.encode_scale = min(1.0, self.encode_scale + 0.25)
-                self._fast_streak = 0
-                self.server.log.emit(
-                    f"采集+编码余量充足，编码分辨率恢复到 {int(self.encode_scale * 100)}%")
+            elif self._fast_streak >= 8:
+                if self.fps_cap and self.fps_cap < base_fps:
+                    self.fps_cap = min(base_fps, self.fps_cap + 5)
+                    self._fast_streak = 0
+                    self.server.log.emit(f"余量充足，帧率上限回到 {self.fps_cap} FPS")
+                elif self.encode_scale < 1.0:
+                    self.encode_scale = min(1.0, self.encode_scale + 0.25)
+                    self._fast_streak = 0
+                    self.server.log.emit(
+                        f"采集+编码余量充足，编码分辨率恢复到 {int(self.encode_scale * 100)}%")
         if self.media_tx:
             self.media_tx.set_bitrate(target)
         self.server.stats.emit({
@@ -571,7 +585,7 @@ class ClientHandler:
             "dropped": dropped_total,
             "qos": round(self.qos.level, 2),
             "qf": int(self.qos.params["quality"]),
-            "fps_target": int(self.qos.params["fps"]),
+            "fps_target": self._effective_fps(),
             "codec": self.codec_name,
             "bitrate": int(target),
             "enc": round(self.enc_ema, 1),
@@ -698,6 +712,13 @@ class ClientHandler:
                 pass
             self.server.unregister(self)
 
+    def _effective_fps(self) -> int:
+        """实际发送帧率：预设帧率与运行时下调值取小。"""
+        base = max(15, int(self.qos.params.get("fps", 30)))
+        if self.fps_cap:
+            return max(15, min(base, int(self.fps_cap)))
+        return base
+
     def _send_loop(self, screen):
         # 节拍用高精度时钟：Windows 上 time.monotonic() 只有约 15.6ms 粒度，
         # 用它算帧间隔会让每帧多睡一次，30 FPS 被压到 20 FPS 左右。
@@ -706,10 +727,7 @@ class ClientHandler:
         jpeg_active = False
         while self.alive:
             media = self._media_alive()
-            if media and self.encoder:
-                target_fps = self.encoder.fps
-            else:
-                target_fps = int(screen.params.get("fps", 30))
+            target_fps = self._effective_fps()
             if self.transfer_active:
                 # 传文件时把画面降到 8 FPS，把带宽和 CPU 让给文件通道。
                 target_fps = min(target_fps, 8)
