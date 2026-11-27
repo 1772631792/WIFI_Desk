@@ -1,0 +1,29 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# PyInstaller 打包产物（体积大，不入库）
+build/
+dist/
+*.spec
+
+# 运行/自检日志
+*.log
+selftest.log
+
+# 编辑器与 IDE 本地状态
+.idea/
+.vscode/
+.codebuddy/
+
+# 操作系统杂项
+Thumbs.db
+desktop.ini
+.DS_Store
