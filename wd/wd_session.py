@@ -19,6 +19,10 @@ RESUME_TTL = 120.0
 TILES_PER_MESSAGE = 128  # 留在现有协议的 8 KiB 消息头限制内
 MEDIA_GRACE = 5.0        # 首帧送达前允许的协商时间
 MEDIA_ACK_TIMEOUT = 3.0  # 超过该时长没有媒体确认就回退图块
+# 无损档的静止/运动切换阈值（按变化面积占比）：大范围变化交给视频保帧率，
+# 回落后补一张无损全帧把文字重新变实。
+HYBRID_MOTION = 0.45
+HYBRID_STATIC = 0.10
 FILE_CHUNK_SIZE = 128 * 1024
 FILE_WINDOW = 2 * 1024 * 1024    # 发送队列最多积压 2MB，避免大文件把内存顶爆
 FILE_MAX_BYTES = 8 * 1024 ** 3
@@ -180,6 +184,7 @@ class ClientHandler:
         self.quality = quality
         # 无损档走图块通道；视频通道保留但不发帧，切回其它档位能立刻恢复。
         self.tile_mode = quality == "pixel"
+        self.hybrid_video = False
         self.capture = _capture().ScreenCapture(quality)
         self.qos = _capture().AdaptiveQuality(quality)
         self.capture.params = self.qos.params
@@ -272,6 +277,7 @@ class ClientHandler:
             self.capture.prev = None
         elif not want_tiles and self.tile_mode:
             self.tile_mode = False
+            self.hybrid_video = False
             self._on_key_request()
         return True
 
@@ -340,8 +346,21 @@ class ClientHandler:
                 sample = self.capture.grab()      # 用真实画面做选型基准，避免低估复杂内容
             except Exception:
                 sample = None
-            encoder = wd_codec.H264Encoder(ew, eh, fps, bitrate, crf=crf,
-                                           family=family, sample=sample)
+            # 选型要逐个实测编码器，QSV 光建会话就要 0.8~0.9 秒，全跑一遍 2 秒多。
+            # 记住上次选中的编码器，重连直接用它，避免每次连上都先卡两秒。
+            cached = str(self.server.config.get("encoder", "") or "")
+            encoder = None
+            if cached:
+                try:
+                    encoder = wd_codec.H264Encoder(ew, eh, fps, bitrate, crf=crf,
+                                                   codec=cached, family=family)
+                except Exception:
+                    encoder = None
+                    self.server.config.set("encoder", "")
+            if encoder is None:
+                encoder = wd_codec.H264Encoder(ew, eh, fps, bitrate, crf=crf,
+                                               family=family, sample=sample)
+                self.server.config.set("encoder", encoder.name)
             self.encoder = encoder
             self.family = encoder.family
             self.codec_name = f"{encoder.name}{'(硬件)' if encoder.hardware else '(软件)'}"
@@ -382,8 +401,9 @@ class ClientHandler:
             bitrate = int(self.qos.params["bitrate"])
             crf = int(self.qos.params.get("crf", 20))
         # 偶数宽高：H.264 4:2:0 编码要求，缩放后也要满足。
-        ew = max(2, int(cur.shape[1] * self.encode_scale) // 2 * 2)
-        eh = max(2, int(cur.shape[0] * self.encode_scale) // 2 * 2)
+        scale = 1.0 if self.tile_mode else self.encode_scale
+        ew = max(2, int(cur.shape[1] * scale) // 2 * 2)
+        eh = max(2, int(cur.shape[0] * scale) // 2 * 2)
         try:
             stale = (self.encoder is None
                      or self.encoder.width != ew
@@ -457,19 +477,40 @@ class ClientHandler:
         return True
 
     def _send_tiles(self, screen, cur, jpeg_active: bool):
-        force_full = False
+        want_video = False
         with self.capture_lock:
             params = screen.params
             full_frame = screen.prev is None or screen.prev.shape != cur.shape
             tiles, ratio = screen.diff(cur)
-            use_jpeg = not full_frame and ratio >= params["dynamic_ratio"]
+            force_full = False
+            if self.tile_mode and self.media_ok and not full_frame:
+                # 静止/运动混合：画面大范围变化（滚动、播放）时交给 H.264 保帧率，
+                # 停下来以后再补一张无损全帧，文字重新变实。带迟滞，避免来回切。
+                if self.hybrid_video:
+                    if ratio <= HYBRID_STATIC:
+                        self.hybrid_video = False
+                        self.capture.prev = None
+                        tiles, ratio = screen.snapshot(cur), 1.0
+                        force_full = True
+                    else:
+                        want_video = True
+                        tiles = []
+                elif ratio >= HYBRID_MOTION:
+                    self.hybrid_video = True
+                    want_video = True
+                    tiles = []
+            # 强制整帧时（从视频切回无损）不要用 JPEG，否则刚变实的文字又被压一遍。
+            use_jpeg = (not full_frame and not force_full
+                        and ratio >= params["dynamic_ratio"])
             if jpeg_active and not use_jpeg and not full_frame:
                 # 还原 JPEG 压过、但最近没有变化的像素。
                 tiles = screen.snapshot(cur)
                 force_full = True
+        if want_video:
+            return True, jpeg_active, True
         self._last_tiles = len(tiles)
         if not tiles:
-            return True, jpeg_active
+            return True, jpeg_active, False
         messages = []
         if use_jpeg:
             jpeg = screen.encode_jpeg(cur, params["quality"], params["full_chroma"])
@@ -496,10 +537,10 @@ class ClientHandler:
             self.mode = "TILE无损"
         # 整帧作为一个批次入队：队里已有未发完的旧帧时直接丢弃旧帧。
         if not self.sender or not self.sender.send_batch(messages, video=True):
-            return False, jpeg_active
+            return False, jpeg_active, False
         self.frames += 1
         self.bytes_frame += size
-        return True, use_jpeg
+        return True, use_jpeg, False
 
     def _publish_stats(self, now: float):
         elapsed = now - self.last_stat
@@ -780,8 +821,10 @@ class ClientHandler:
                 if not self._send_video(screen, cur):
                     break
             else:
-                ok, jpeg_active = self._send_tiles(screen, cur, jpeg_active)
+                ok, jpeg_active, want_video = self._send_tiles(screen, cur, jpeg_active)
                 if not ok:
+                    break
+                if want_video and not self._send_video(screen, cur):
                     break
             now = time.monotonic()
             if now - self.last_stat >= 1.0:
@@ -964,6 +1007,8 @@ class ClientSession(QObject):
         self.sender = None
         self.canvas = None
         self.frame_lock = threading.Lock()
+        # 无损档会和视频帧交替到达，两条线程都会动 canvas，必须串起来。
+        self.canvas_lock = threading.Lock()
         self.latest_frame = None
         self.failure_reason = "连接已断开"
         self.frames = 0
@@ -1214,8 +1259,9 @@ class ClientSession(QObject):
         if img.isNull():
             return
         if self.canvas is None or (self.canvas.width(), self.canvas.height()) != (width, height):
-            self.canvas = QImage(width, height, QImage.Format_RGB888)
-            self.canvas.fill(QColor("#101318"))
+            with self.canvas_lock:
+                self.canvas = QImage(width, height, QImage.Format_RGB888)
+                self.canvas.fill(QColor("#101318"))
         self.mode = "H.265" if self.codec_name == "hevc" else "H.264"
         with self.frame_lock:
             notify = self.latest_frame is None
@@ -1346,7 +1392,8 @@ class ClientSession(QObject):
                 if img.isNull():
                     self.resync()
                     continue
-                self.canvas = img.convertToFormat(QImage.Format_RGB888)
+                with self.canvas_lock:
+                    self.canvas = img.convertToFormat(QImage.Format_RGB888)
                 self.mode = "JPEG兼容"
             elif typ == "PING":
                 self._send("PONG", t=meta.get("t", 0), priority=True)
@@ -1374,11 +1421,13 @@ class ClientSession(QObject):
             else:
                 continue
             if typ in ("FRAME_TILES", "FRAME_JPEG"):
+                with self.canvas_lock:
+                    frame_copy = self.canvas.copy()
                 with self.frame_lock:
                     notify = self.latest_frame is None
                     # QImage(canvas) 只是浅拷贝，会与画布共享像素；UI 线程读取时
                     # 接收线程仍在画Tiles，必须深拷贝，否则画面会撕裂/闪黑块
-                    self.latest_frame = self.canvas.copy()
+                    self.latest_frame = frame_copy
                 if notify:
                     self.frame_ready.emit()
                 self.frames += 1
@@ -1387,6 +1436,10 @@ class ClientSession(QObject):
         self.alive = False
 
     def _apply_tiles(self, meta, payload: bytes) -> bool:
+        with self.canvas_lock:
+            return self._apply_tiles_locked(meta, payload)
+
+    def _apply_tiles_locked(self, meta, payload: bytes) -> bool:
         if self.canvas is None:
             return False
         w, h = meta.get("w"), meta.get("h")

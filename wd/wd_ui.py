@@ -351,6 +351,11 @@ class RemoteWindow(QWidget):
         self.config = config
         self.canvas = QImage()
         self._last_view_at = 0.0
+        self._in_view = False
+        self._view_timer = QTimer(self)
+        self._view_timer.setSingleShot(True)
+        self._view_timer.setInterval(0)
+        self._view_timer.timeout.connect(self.update_view)
         self.scale = 1.0
         self.offset = (0, 0)
         self.zoom = "fit"
@@ -486,8 +491,15 @@ class RemoteWindow(QWidget):
 
     def eventFilter(self, obj, event):
         if obj is self.scroll.viewport() and event.type() == QEvent.Resize:
-            self.update_view()
+            # 合并到下一轮事件循环再重排：滚动条显隐会再次改变视口尺寸，
+            # 在 resize 事件里同步重排容易来回触发，窗口一缩放就像卡住。
+            self._schedule_view()
         return super().eventFilter(obj, event)
+
+    def _schedule_view(self):
+        # 用成员 QTimer 而不是 singleShot(callable)：窗口关闭后定时器随对象一起销毁，
+        # 不会回调到已释放的控件上。
+        self._view_timer.start()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -495,7 +507,7 @@ class RemoteWindow(QWidget):
             self.toolbar.resize(self.width(), 48)
             self.toolbar.move(0, 0)
         self._place_overlay()
-        self.update_view()
+        self._schedule_view()
 
     def _place_overlay(self):
         if self.status_overlay.isVisible():
@@ -524,6 +536,15 @@ class RemoteWindow(QWidget):
         self.update_view()
 
     def update_view(self):
+        if self._in_view:
+            return
+        self._in_view = True
+        try:
+            self._render_view()
+        finally:
+            self._in_view = False
+
+    def _render_view(self):
         if self.canvas.isNull():
             return
         area = self.scroll.viewport().size()
@@ -533,7 +554,10 @@ class RemoteWindow(QWidget):
         if self.zoom == "one":
             logical = self.canvas.size()
         elif self.zoom == "width":
-            ratio = min(1.0, area.width() / max(1, self.canvas.width()))
+            # 用固定的可用宽度算比例，不看滚动条当前是否显示：否则"缩放→出滚动条→
+            # 视口变小→再缩放"会来回触发，表现就是窗口一改大小就卡住。
+            avail = max(1, self.scroll.width() - 18)
+            ratio = min(1.0, avail / max(1, self.canvas.width()))
             # 只差几个百分点时直接按 1:1 显示：为了塞进窗口做 0.99 倍重采样，
             # 反而把 1 像素的笔画抹开，得不偿失。
             if ratio >= 0.97:
@@ -709,7 +733,8 @@ class RemoteWindow(QWidget):
             scale_txt = f"（画面 {stream_w}×{stream_h}）"
         self.mode_label.setText(
             f"模式：{data.get('mode', '-')}{detail} · {data.get('fps', 0)} FPS · "
-            f"{remote_w}×{remote_h}{scale_txt} · 自适应 {qos_pct}%"
+            f"{remote_w}×{remote_h}{scale_txt} · 延迟 {data.get('rtt', 0)} ms · "
+            f"自适应 {qos_pct}%"
         )
         dec = float(data.get("dec", 0) or 0)
         dec_txt = f"   解码 {dec:.0f} ms" if dec else ""

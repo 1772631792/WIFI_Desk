@@ -2,6 +2,7 @@
 import json
 import os
 import socket
+import threading
 import uuid
 
 from . import wd_crypto
@@ -19,6 +20,7 @@ DEFAULTS = {
     "quality": "auto",
     "media": "auto",
     "codec": "auto",
+    "encoder": "",          # 上次实测选中的编码器，重连时直接用，省掉 2 秒选型
     "known_devices": {},
 }
 
@@ -27,6 +29,8 @@ class Config:
     def __init__(self):
         os.makedirs(APP_DIR, exist_ok=True)
         self.path = os.path.join(APP_DIR, "config.json")
+        # 会话线程（编码器选型回写）和界面线程都会写配置，落盘要串起来。
+        self._lock = threading.RLock()
         data = dict(DEFAULTS)
         if os.path.exists(self.path):
             try:
@@ -50,14 +54,16 @@ class Config:
         return self.data.get(key, default)
 
     def set(self, key, value):
-        self.data[key] = value
-        self.save()
+        with self._lock:
+            self.data[key] = value
+            self.save()
 
     def save(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
+        with self._lock:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
 
     @property
     def device_id(self):
